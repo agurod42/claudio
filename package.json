@@ -1,0 +1,30 @@
+{
+  "name": "clawdly-deploy",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --import tsx src/deploy/server.ts",
+    "start": "node --import tsx src/deploy/server.ts"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc.9",
+    "dockerode": "^4.0.2",
+    "express": "^5.2.1",
+    "pg": "^8.13.0",
+    "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^3.3.30",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.2.1",
+    "@types/pg": "^8.10.2",
+    "@types/qrcode": "1.5.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@10.23.0"
+}

@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: clawdly
+      POSTGRES_PASSWORD: clawdly
+      POSTGRES_DB: clawdly
+    ports:
+      - "5432:5432"
+    volumes:
+      - clawdly_pg:/var/lib/postgresql/data
+
+  gateway-image:
+    build:
+      context: ./openclaw
+    image: openclaw-gateway:local
+    command:
+      [
+        "node",
+        "-e",
+        "console.log('gateway-image: build helper completed; exit code 0 is expected.')",
+      ]
+    restart: "no"
+
+  deploy:
+    build: .
+    environment:
+      OPENCLAW_DEPLOY_DATABASE_URL: postgres://clawdly:clawdly@db:5432/clawdly
+      OPENCLAW_DEPLOY_PROVISIONER: docker
+      OPENCLAW_DEPLOY_DOCKER_IMAGE: openclaw-gateway:local
+      OPENCLAW_DEPLOY_DOCKER_AUTH_VOLUME: ${COMPOSE_PROJECT_NAME:-clawdly-deploy}_clawdly_auth
+      OPENCLAW_DEPLOY_AUTH_ROOT: /data/auth
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - clawdly_auth:/data/auth
+      # Linux/macOS: allow Docker provisioner to start gateway containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_started
+      gateway-image:
+        condition: service_completed_successfully
+
+volumes:
+  clawdly_pg:
+  clawdly_auth:

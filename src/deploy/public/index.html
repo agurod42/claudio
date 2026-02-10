@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw WhatsApp Deploy</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="page">
+      <header class="nav">
+        <div class="logo">OpenClaw</div>
+        <nav class="nav-links">
+          <a href="#how">How it works</a>
+          <a href="#faq">FAQ</a>
+        </nav>
+        <button class="ghost-btn" id="cta-top">Connect WhatsApp</button>
+      </header>
+
+      <main class="main">
+        <section class="screen screen-active" id="screen-landing">
+          <div class="hero">
+            <div class="hero-copy">
+              <p class="eyebrow">WhatsApp first</p>
+              <h1>Deploy your personal AI agent on WhatsApp.</h1>
+              <p class="subhead">One click. One scan. You are live.</p>
+              <div class="hero-actions">
+                <button class="primary-btn" id="cta-hero">Connect WhatsApp</button>
+                <button class="text-btn" id="cta-how">See how it works</button>
+              </div>
+              <div class="hero-note">Managed hosting included. No setup required.</div>
+            </div>
+            <div class="hero-card">
+              <div class="card-label">Your agent</div>
+              <div class="card-title">Claw</div>
+              <div class="card-meta">Private by default. Replies only to you.</div>
+              <div class="card-pill">Best overall model</div>
+              <div class="card-pill">Auto updates</div>
+            </div>
+          </div>
+
+          <div class="steps" id="how">
+            <div class="step">
+              <div class="step-number">1</div>
+              <div>
+                <div class="step-title">Connect WhatsApp</div>
+                <div class="step-desc">Scan the QR from Linked Devices.</div>
+              </div>
+            </div>
+            <div class="step">
+              <div class="step-number">2</div>
+              <div>
+                <div class="step-title">We deploy your agent</div>
+                <div class="step-desc">Usually ready in about a minute.</div>
+              </div>
+            </div>
+            <div class="step">
+              <div class="step-number">3</div>
+              <div>
+                <div class="step-title">Start chatting</div>
+                <div class="step-desc">Open WhatsApp and say hello.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-pairing">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Scan to connect</h2>
+              <p>Open WhatsApp, go to Linked Devices, and scan this QR.</p>
+            </div>
+            <div class="qr-wrap">
+              <canvas id="qr-canvas" width="260" height="260"></canvas>
+              <div class="qr-meta">
+                <span id="qr-status">Waiting for QR</span>
+                <span id="qr-expiry"></span>
+              </div>
+            </div>
+            <div class="panel-footer">
+              <p class="muted">This creates your account and links your agent.</p>
+              <button class="ghost-btn" id="cta-restart">Restart</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-deploying">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Deploying your agent</h2>
+              <p>This takes about 30 to 60 seconds.</p>
+            </div>
+            <div class="loader">
+              <div class="loader-bar"></div>
+            </div>
+            <p class="muted">We will open WhatsApp when it is ready.</p>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-success">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>You are live on WhatsApp</h2>
+              <p>Try: "Summarize my last 10 messages."</p>
+            </div>
+            <div class="success-actions">
+              <a class="primary-btn" id="cta-open-whatsapp" href="https://wa.me" target="_blank"
+                >Open WhatsApp</a
+              >
+              <button class="ghost-btn" id="cta-customize">Customize your agent</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-customize">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Customize your agent</h2>
+              <p>Optional. Your agent is already live.</p>
+            </div>
+            <form id="customize-form" class="form">
+              <label>
+                Agent name
+                <input type="text" name="name" placeholder="Claw" />
+              </label>
+              <label>
+                Tone
+                <input type="text" name="tone" placeholder="Clear and concise" />
+              </label>
+              <label>
+                Model tier
+                <select name="modelTier">
+                  <option value="best">Best overall</option>
+                  <option value="fast">Fast and affordable</option>
+                  <option value="premium">Premium reasoning</option>
+                </select>
+              </label>
+              <label>
+                Language
+                <input type="text" name="language" placeholder="Auto" />
+              </label>
+              <label class="toggle">
+                <input type="checkbox" name="allowlistOnly" checked />
+                Only allow my number to chat
+              </label>
+              <div class="form-actions">
+                <button class="primary-btn" type="submit">Save changes</button>
+                <button class="ghost-btn" type="button" id="cta-skip">Skip for now</button>
+              </div>
+              <div class="form-status" id="customize-status"></div>
+            </form>
+          </div>
+        </section>
+
+        <section class="screen screen-active" id="screen-faq">
+          <div class="faq" id="faq">
+            <h2>FAQ</h2>
+            <div class="faq-item">
+              <h3>Is this my personal WhatsApp number?</h3>
+              <p>
+                Yes. We connect your number directly so it is truly yours. You can switch to a spare
+                number later.
+              </p>
+            </div>
+            <div class="faq-item">
+              <h3>Does it message my contacts?</h3>
+              <p>No. It only replies to you unless you explicitly allow others.</p>
+            </div>
+            <div class="faq-item">
+              <h3>What if I disconnect?</h3>
+              <p>You can reconnect anytime by scanning a new QR.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <div>
+          <div class="footer-title">Get your agent on WhatsApp in one click.</div>
+          <button class="primary-btn" id="cta-footer">Connect WhatsApp</button>
+        </div>
+        <div class="footer-meta">OpenClaw Deploy</div>
+      </footer>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
