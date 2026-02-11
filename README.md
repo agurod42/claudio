@@ -34,6 +34,12 @@ docker compose up
 
 4. Open `http://localhost:8080` and connect WhatsApp.
 
+Admin dashboard:
+- Open `http://localhost:8080/admin`
+- If `OPENCLAW_DEPLOY_ADMIN_TOKEN` is set, enter it in the dashboard header.
+- For per-user OpenClaw connect links, set `OPENCLAW_DEPLOY_DOCKER_NETWORK` to your compose network (default shown below).
+- Existing gateway containers created before these settings may need re-provisioning (reconnect flow) to pick up connect-link support.
+
 5. Stop services when done:
 ```bash
 docker compose down
@@ -61,6 +67,9 @@ You will see `gateway-image` exit with code `0`; this is expected because it is 
 - `OPENCLAW_DEPLOY_DOCKER_NETWORK` — Docker network (optional).
 - `OPENCLAW_DEPLOY_DOCKER_AUTH_VOLUME` — shared Docker volume name used for gateway auth/config handoff.
 - `OPENCLAW_DEPLOY_DOCKER_PREFIX` — container name prefix.
+- `OPENCLAW_DEPLOY_DOCKER_GATEWAY_UID` — UID used by gateway container process for auth volume ownership (default `1000`).
+- `OPENCLAW_DEPLOY_DOCKER_GATEWAY_GID` — GID used by gateway container process for auth volume ownership (default `1000`).
+- `OPENCLAW_DEPLOY_ADMIN_TOKEN` — optional token for admin APIs/dashboard. In production, admin routes are disabled unless this is set.
 - `OPENCLAW_DEPLOY_REAPER_INTERVAL_MS` — reaper interval.
 - `OPENCLAW_DEPLOY_REAPER_TTL_MS` — stale container TTL.
 - Provider keys (forwarded to each gateway container when set):

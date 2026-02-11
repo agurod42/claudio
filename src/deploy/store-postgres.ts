@@ -108,6 +108,11 @@ export class PostgresStore implements DeployStore {
     return mapLoginSession(result.rows[0]);
   }
 
+  async listLoginSessions(): Promise<LoginSession[]> {
+    const result = await this.pool.query("select * from login_sessions order by created_at desc");
+    return result.rows.map(mapLoginSession);
+  }
+
   async updateLoginSession(id: string, update: LoginSessionUpdate): Promise<LoginSession | null> {
     const fields: string[] = [];
     const values: unknown[] = [];
@@ -157,6 +162,16 @@ export class PostgresStore implements DeployStore {
       [userId, whatsappId, "active"],
     );
     return mapUser(created.rows[0]);
+  }
+
+  async listUsers(): Promise<UserRecord[]> {
+    const result = await this.pool.query("select * from users order by created_at desc");
+    return result.rows.map(mapUser);
+  }
+
+  async listAgents(): Promise<AgentRecord[]> {
+    const result = await this.pool.query("select * from agents order by created_at desc");
+    return result.rows.map(mapAgent);
   }
 
   async getAgentByUserId(userId: string): Promise<AgentRecord | null> {

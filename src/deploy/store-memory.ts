@@ -24,6 +24,12 @@ export class MemoryStore implements DeployStore {
     return this.sessions.get(id) ?? null;
   }
 
+  async listLoginSessions(): Promise<LoginSession[]> {
+    return Array.from(this.sessions.values()).sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
+    );
+  }
+
   async updateLoginSession(id: string, update: LoginSessionUpdate): Promise<LoginSession | null> {
     const existing = this.sessions.get(id);
     if (!existing) {
@@ -55,6 +61,16 @@ export class MemoryStore implements DeployStore {
     this.users.set(user.id, user);
     this.usersByWhatsapp.set(whatsappId, user.id);
     return user;
+  }
+
+  async listUsers(): Promise<UserRecord[]> {
+    return Array.from(this.users.values()).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  async listAgents(): Promise<AgentRecord[]> {
+    return Array.from(this.agents.values()).sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
+    );
   }
 
   async getAgentByUserId(userId: string): Promise<AgentRecord | null> {

@@ -1,0 +1,259 @@
+:root {
+  --bg: #f7f5f2;
+  --panel: #ffffff;
+  --ink: #1f231f;
+  --muted: #5f665f;
+  --border: #d7ddd6;
+  --accent: #186f57;
+  --accent-soft: #dbefe7;
+  --warn: #995c00;
+  --warn-soft: #ffe8c6;
+  --bad: #a52836;
+  --bad-soft: #ffe2e6;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(960px 520px at 14% -6%, #edf6f3 0%, transparent 60%),
+    radial-gradient(840px 500px at 92% 0%, #f4eee4 0%, transparent 55%),
+    var(--bg);
+}
+
+.page {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 28px 22px 56px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.eyebrow {
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 1.8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+h1 {
+  margin: 6px 0 8px;
+  font-size: clamp(26px, 3.6vw, 40px);
+}
+
+.generated-at {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+input,
+select,
+button {
+  font: inherit;
+}
+
+input,
+select {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  min-width: 240px;
+  background: #fff;
+}
+
+button {
+  border-radius: 999px;
+  padding: 10px 16px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.primary-btn {
+  background: var(--accent);
+  color: #fff;
+}
+
+.ghost-btn {
+  background: #fff;
+  border-color: var(--border);
+  color: var(--ink);
+}
+
+.cards {
+  margin-top: 20px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.card-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.card-value {
+  font-weight: 700;
+  font-size: 26px;
+}
+
+.panel {
+  margin-top: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.panel-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.small-meta {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th,
+td {
+  border-top: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  padding: 10px 8px;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.status {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-running,
+.status-ready,
+.status-active {
+  background: var(--accent-soft);
+  color: #104b3b;
+}
+
+.status-waiting,
+.status-linked,
+.status-deploying,
+.status-provisioning,
+.status-pending,
+.status-stopped,
+.status-expired {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.status-error,
+.status-disconnected {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+
+.subtle {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.actions-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mini-link {
+  display: inline-block;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 9px;
+  text-decoration: none;
+  color: inherit;
+  font-size: 12px;
+}
+
+.empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+@media (max-width: 760px) {
+  .page {
+    padding: 18px 10px 40px;
+  }
+
+  input,
+  select {
+    min-width: 180px;
+  }
+}

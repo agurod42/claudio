@@ -16,6 +16,8 @@ type DockerProvisionerOptions = {
   network?: string;
   authVolume?: string;
   containerPrefix: string;
+  gatewayUid: number;
+  gatewayGid: number;
 };
 
 const GATEWAY_ENV_PASSTHROUGH = [
@@ -94,6 +96,25 @@ const resolveGatewayProviderEnv = () =>
 
 const resolveContainerName = (prefix: string, userId: string) => `${prefix}${userId}`;
 
+const chownRecursive = async (targetPath: string, uid: number, gid: number): Promise<void> => {
+  let stat: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    stat = await fs.lstat(targetPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  if (stat.isDirectory()) {
+    const entries = await fs.readdir(targetPath);
+    for (const entry of entries) {
+      await chownRecursive(path.join(targetPath, entry), uid, gid);
+    }
+  }
+  await fs.chown(targetPath, uid, gid);
+};
+
 export class DockerProvisioner implements Provisioner {
   private docker: Docker;
   private opts: DockerProvisionerOptions;
@@ -105,6 +126,8 @@ export class DockerProvisioner implements Provisioner {
       network: deployConfig.dockerNetwork || undefined,
       authVolume: deployConfig.dockerAuthVolume || undefined,
       containerPrefix: deployConfig.dockerContainerPrefix,
+      gatewayUid: deployConfig.dockerGatewayUid,
+      gatewayGid: deployConfig.dockerGatewayGid,
       ...opts,
     };
   }
@@ -114,6 +137,7 @@ export class DockerProvisioner implements Provisioner {
     const gatewayToken = randomBytes(24).toString("hex");
     const gatewayPaths = resolveGatewayPaths(authDir, this.opts.authVolume);
     await ensureConfigFile(authDir, gatewayPaths.gatewayAuthDir, whatsappId, gatewayToken);
+    await this.ensureGatewayAuthOwnership(authDir);
     const containerName = resolveContainerName(this.opts.containerPrefix, userId);
 
     const existing = await this.findContainerByName(containerName);
@@ -139,6 +163,7 @@ export class DockerProvisioner implements Provisioner {
     const container = await this.docker.createContainer({
       Image: this.opts.image,
       name: containerName,
+      Cmd: ["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan"],
       Env: env,
       HostConfig: hostConfig,
       Labels: {
@@ -154,6 +179,21 @@ export class DockerProvisioner implements Provisioner {
       status: "running",
     });
     return updated ?? instance;
+  }
+
+  private async ensureGatewayAuthOwnership(authDir: string): Promise<void> {
+    if (!this.opts.authVolume) {
+      return;
+    }
+    const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
+    const currentGid = typeof process.getgid === "function" ? process.getgid() : null;
+    if (currentUid === this.opts.gatewayUid && currentGid === this.opts.gatewayGid) {
+      return;
+    }
+    if (currentUid !== 0) {
+      return;
+    }
+    await chownRecursive(authDir, this.opts.gatewayUid, this.opts.gatewayGid);
   }
 
   private async findContainerByName(name: string) {

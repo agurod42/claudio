@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw Deploy Admin</title>
+    <link rel="stylesheet" href="/admin.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">Support Console</div>
+          <h1>OpenClaw Deploy Admin</h1>
+          <p id="generated-at" class="generated-at">Loading data...</p>
+        </div>
+        <div class="actions">
+          <input
+            id="admin-token"
+            type="password"
+            placeholder="Admin token (optional in dev)"
+            autocomplete="off"
+          />
+          <button id="save-token" class="ghost-btn" type="button">Save token</button>
+          <button id="refresh" class="primary-btn" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="cards" id="stats-cards"></section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Users</h2>
+          <div class="panel-controls">
+            <input id="user-search" type="text" placeholder="Search by user, phone, container..." />
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>WhatsApp</th>
+                <th>User</th>
+                <th>Agent</th>
+                <th>Latest Session</th>
+                <th>Gateway</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="users-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Gateway Instances</h2>
+          <div class="panel-controls">
+            <span id="gateways-count" class="small-meta"></span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Gateway ID</th>
+                <th>User</th>
+                <th>Status</th>
+                <th>Container</th>
+                <th>Auth Dir</th>
+                <th>Created</th>
+                <th>Connect</th>
+              </tr>
+            </thead>
+            <tbody id="gateways-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Login Sessions</h2>
+          <div class="panel-controls">
+            <input id="session-search" type="text" placeholder="Search session/user/error..." />
+            <select id="session-state">
+              <option value="all">All states</option>
+              <option value="waiting">waiting</option>
+              <option value="linked">linked</option>
+              <option value="deploying">deploying</option>
+              <option value="ready">ready</option>
+              <option value="expired">expired</option>
+              <option value="error">error</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Session</th>
+                <th>State</th>
+                <th>User</th>
+                <th>WhatsApp</th>
+                <th>Created</th>
+                <th>Expires</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody id="sessions-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <script src="/admin.js"></script>
+  </body>
+</html>

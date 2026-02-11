@@ -24,8 +24,11 @@ export type LoginSessionUpdate = {
 export interface DeployStore {
   createLoginSession(session: LoginSession): Promise<LoginSession>;
   getLoginSession(id: string): Promise<LoginSession | null>;
+  listLoginSessions(): Promise<LoginSession[]>;
   updateLoginSession(id: string, update: LoginSessionUpdate): Promise<LoginSession | null>;
+  listUsers(): Promise<UserRecord[]>;
   getOrCreateUserByWhatsappId(whatsappId: string): Promise<UserRecord>;
+  listAgents(): Promise<AgentRecord[]>;
   getAgentByUserId(userId: string): Promise<AgentRecord | null>;
   createAgentForUser(userId: string, settings: AgentSettings): Promise<AgentRecord>;
   updateAgentSettings(userId: string, update: Partial<AgentSettings>): Promise<AgentRecord | null>;
