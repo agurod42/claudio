@@ -269,6 +269,12 @@ export class PostgresStore implements DeployStore {
       `insert into gateway_instances
       (id, user_id, container_id, status, auth_dir_path)
       values ($1,$2,$3,$4,$5)
+      on conflict (user_id)
+      do update set
+        status = excluded.status,
+        auth_dir_path = excluded.auth_dir_path,
+        container_id = null,
+        created_at = now()
       returning *`,
       [id, userId, null, "provisioning", authDir],
     );

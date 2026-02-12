@@ -137,6 +137,18 @@ export class MemoryStore implements DeployStore {
     authDir: string,
   ): Promise<GatewayInstanceRecord> {
     const now = new Date();
+    const existing = await this.getGatewayInstanceByUserId(userId);
+    if (existing) {
+      const updated: GatewayInstanceRecord = {
+        ...existing,
+        status: "provisioning",
+        authDirPath: authDir,
+        containerId: null,
+        createdAt: now,
+      };
+      this.gateways.set(existing.id, updated);
+      return updated;
+    }
     const instance: GatewayInstanceRecord = {
       id: `gw_${randomUUID()}`,
       userId,
