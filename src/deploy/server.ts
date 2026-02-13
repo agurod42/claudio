@@ -1,5 +1,6 @@
 import express from "express";
 import Docker from "dockerode";
+import { STATUS_CODES, type IncomingMessage, request as httpRequest } from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +19,7 @@ import {
 } from "./store.js";
 import type { SessionEvent } from "./session-events.js";
 import { issueToken, verifyToken } from "./auth.js";
+import type { ModelTier } from "./types.js";
 
 const toJson = (value: unknown) => JSON.stringify(value);
 
@@ -98,6 +100,31 @@ const getAdminTokenFromRequest = (req: express.Request) => {
   return queryToken;
 };
 
+const getAdminTokenFromIncomingRequest = (req: IncomingMessage) => {
+  const explicit = req.headers["x-admin-token"];
+  if (typeof explicit === "string" && explicit.trim().length > 0) {
+    return explicit.trim();
+  }
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string") {
+    const [scheme, token] = authHeader.split(" ");
+    if (scheme?.toLowerCase() === "bearer" && token?.trim()) {
+      return token.trim();
+    }
+  }
+  try {
+    const rawUrl = req.url ?? "/";
+    const parsed = new URL(rawUrl, "http://localhost");
+    const queryToken = parsed.searchParams.get("adminToken");
+    if (queryToken && queryToken.trim().length > 0) {
+      return queryToken.trim();
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+};
+
 const isAdminDisabled = () => deployConfig.env === "production" && !deployConfig.adminToken.trim();
 
 const getProxyHeaderValue = (value: string | string[] | undefined) => {
@@ -108,6 +135,153 @@ const getProxyHeaderValue = (value: string | string[] | undefined) => {
     return value[0];
   }
   return null;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const normalizeOrigin = (value: string | null | undefined) => {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return null;
+  }
+};
+
+const resolveDefaultControlUiAllowedOrigins = () => {
+  const candidates = [
+    deployConfig.baseUrl,
+    `http://localhost:${deployConfig.port}`,
+    `http://127.0.0.1:${deployConfig.port}`,
+    `http://[::1]:${deployConfig.port}`,
+  ];
+  const unique = new Set<string>();
+  for (const candidate of candidates) {
+    const normalized = normalizeOrigin(candidate);
+    if (normalized) {
+      unique.add(normalized);
+    }
+  }
+  return Array.from(unique);
+};
+
+const DEFAULT_TOOLS_PROFILE = "minimal";
+
+const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
+  best: "groq/llama-3.3-70b-versatile",
+  fast: "groq/llama-3.1-8b-instant",
+  premium: "groq/llama-3.3-70b-versatile",
+};
+
+const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
+  best: ["groq/llama-3.1-8b-instant"],
+  fast: ["groq/llama-3.3-70b-versatile"],
+  premium: ["groq/llama-3.1-8b-instant"],
+};
+
+const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
+  // Keep context conservative to stay under Groq per-request TPM limits.
+  best: 16_000,
+  fast: 16_000,
+  premium: 16_000,
+};
+
+const resolvePrimaryModelForTier = (modelTier: ModelTier | undefined) =>
+  MODEL_PRIMARY_BY_TIER[modelTier ?? "best"] ?? MODEL_PRIMARY_BY_TIER.best;
+
+const resolveModelFallbacksForTier = (modelTier: ModelTier | undefined) =>
+  [...(MODEL_FALLBACKS_BY_TIER[modelTier ?? "best"] ?? MODEL_FALLBACKS_BY_TIER.best)];
+
+const resolveContextTokensForTier = (modelTier: ModelTier | undefined) =>
+  MODEL_CONTEXT_TOKENS_BY_TIER[modelTier ?? "best"] ?? MODEL_CONTEXT_TOKENS_BY_TIER.best;
+
+const buildHostOrigin = (hostHeader: string | null | undefined, protocol: "http" | "https") => {
+  const trimmed = hostHeader?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return normalizeOrigin(`${protocol}://${trimmed}`);
+};
+
+const ensureGatewayControlUiConfig = async (
+  authDirPath: string,
+  originHints: Array<string | null | undefined>,
+): Promise<{ token: string | null; changed: boolean }> => {
+  try {
+    const configPath = path.join(authDirPath, "openclaw.json");
+    const raw = await fs.readFile(configPath, "utf-8");
+    const parsedUnknown = JSON.parse(raw) as unknown;
+    if (!isRecord(parsedUnknown)) {
+      return { token: null, changed: false };
+    }
+    const parsed = parsedUnknown;
+
+    let changed = false;
+    let gateway = isRecord(parsed.gateway) ? parsed.gateway : null;
+    if (!gateway) {
+      gateway = {};
+      parsed.gateway = gateway;
+      changed = true;
+    }
+    let auth = isRecord(gateway.auth) ? gateway.auth : null;
+    if (!auth) {
+      auth = {};
+      gateway.auth = auth;
+      changed = true;
+    }
+    const tokenValue = typeof auth.token === "string" && auth.token.trim() ? auth.token.trim() : null;
+
+    let controlUi = isRecord(gateway.controlUi) ? gateway.controlUi : null;
+    if (!controlUi) {
+      controlUi = {};
+      gateway.controlUi = controlUi;
+      changed = true;
+    }
+
+    if (controlUi.allowInsecureAuth !== true) {
+      controlUi.allowInsecureAuth = true;
+      changed = true;
+    }
+
+    const existingOrigins = Array.isArray(controlUi.allowedOrigins)
+      ? controlUi.allowedOrigins.map((value) =>
+          typeof value === "string" ? normalizeOrigin(value) : null,
+        )
+      : [];
+    const normalizedExisting = existingOrigins.filter((value): value is string => Boolean(value));
+    const nextOrigins = new Set<string>();
+    for (const origin of normalizedExisting) {
+      nextOrigins.add(origin);
+    }
+    for (const origin of resolveDefaultControlUiAllowedOrigins()) {
+      nextOrigins.add(origin);
+    }
+    for (const hint of originHints) {
+      const normalized = normalizeOrigin(hint);
+      if (normalized) {
+        nextOrigins.add(normalized);
+      }
+    }
+    const nextAllowedOrigins = Array.from(nextOrigins);
+    const originsChanged =
+      normalizedExisting.length !== nextAllowedOrigins.length ||
+      normalizedExisting.some((value, index) => value !== nextAllowedOrigins[index]);
+    if (originsChanged) {
+      controlUi.allowedOrigins = nextAllowedOrigins;
+      changed = true;
+    }
+
+    if (changed) {
+      await fs.writeFile(configPath, JSON.stringify(parsed, null, 2), "utf-8");
+    }
+    return { token: tokenValue, changed };
+  } catch {
+    return { token: null, changed: false };
+  }
 };
 
 const readGatewayTokenFromConfig = async (authDirPath: string): Promise<string | null> => {
@@ -125,6 +299,134 @@ const readGatewayTokenFromConfig = async (authDirPath: string): Promise<string |
   } catch {
     return null;
   }
+};
+
+const ensureGatewayAgentModelConfig = async (
+  authDirPath: string,
+  modelTier: ModelTier | undefined,
+): Promise<{ changed: boolean }> => {
+  try {
+    const configPath = path.join(authDirPath, "openclaw.json");
+    const raw = await fs.readFile(configPath, "utf-8");
+    const parsedUnknown = JSON.parse(raw) as unknown;
+    if (!isRecord(parsedUnknown)) {
+      return { changed: false };
+    }
+    const parsed = parsedUnknown;
+    const targetPrimaryModel = resolvePrimaryModelForTier(modelTier);
+    const targetFallbackModels = resolveModelFallbacksForTier(modelTier);
+    const targetContextTokens = resolveContextTokensForTier(modelTier);
+
+    let changed = false;
+    let agents = isRecord(parsed.agents) ? parsed.agents : null;
+    if (!agents) {
+      agents = {};
+      parsed.agents = agents;
+      changed = true;
+    }
+    let defaults = isRecord(agents.defaults) ? agents.defaults : null;
+    if (!defaults) {
+      defaults = {};
+      agents.defaults = defaults;
+      changed = true;
+    }
+    const currentContextTokens =
+      typeof defaults.contextTokens === "number" && Number.isFinite(defaults.contextTokens)
+        ? Math.floor(defaults.contextTokens)
+        : null;
+    if (currentContextTokens !== targetContextTokens) {
+      defaults.contextTokens = targetContextTokens;
+      changed = true;
+    }
+    let model = isRecord(defaults.model) ? defaults.model : null;
+    if (!model) {
+      model = {};
+      defaults.model = model;
+      changed = true;
+    }
+    const currentPrimaryModel =
+      typeof model.primary === "string" && model.primary.trim().length > 0
+        ? model.primary.trim()
+        : null;
+    if (currentPrimaryModel !== targetPrimaryModel) {
+      model.primary = targetPrimaryModel;
+      changed = true;
+    }
+
+    const currentFallbackModels = Array.isArray(model.fallbacks)
+      ? model.fallbacks
+          .map((value) => (typeof value === "string" ? value.trim() : ""))
+          .filter((value) => value.length > 0)
+      : [];
+    const fallbackChanged =
+      currentFallbackModels.length !== targetFallbackModels.length ||
+      currentFallbackModels.some((value, index) => value !== targetFallbackModels[index]);
+    if (fallbackChanged) {
+      model.fallbacks = targetFallbackModels;
+      changed = true;
+    }
+
+    let tools = isRecord(parsed.tools) ? parsed.tools : null;
+    if (!tools) {
+      tools = {};
+      parsed.tools = tools;
+      changed = true;
+    }
+    const currentToolsProfile =
+      typeof tools.profile === "string" && tools.profile.trim().length > 0
+        ? tools.profile.trim()
+        : null;
+    if (!currentToolsProfile) {
+      tools.profile = DEFAULT_TOOLS_PROFILE;
+      changed = true;
+    }
+
+    if (changed) {
+      await fs.writeFile(configPath, JSON.stringify(parsed, null, 2), "utf-8");
+    }
+    return { changed };
+  } catch {
+    return { changed: false };
+  }
+};
+
+const parseAdminProxyUrl = (rawUrl: string | undefined) => {
+  if (!rawUrl) {
+    return null;
+  }
+  const parsed = new URL(rawUrl, "http://localhost");
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments[0] !== "admin" || segments[1] !== "openclaw" || !segments[2]) {
+    return null;
+  }
+  const userId = decodeURIComponent(segments[2]);
+  if (!userId) {
+    return null;
+  }
+  const suffixPath = `/${segments.slice(3).join("/")}`;
+  const targetPath = `${suffixPath === "/" ? "/" : suffixPath}${parsed.search}`;
+  return { userId, targetPath };
+};
+
+const writeUpgradeJsonError = (
+  socket: NodeJS.WritableStream & { destroy: () => void; writableEnded?: boolean },
+  statusCode: number,
+  body: unknown,
+) => {
+  const payload = JSON.stringify(body);
+  const statusText = STATUS_CODES[statusCode] ?? "Error";
+  if (socket.writableEnded) {
+    return;
+  }
+  socket.write(
+    `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
+      "Content-Type: application/json; charset=utf-8\r\n" +
+      `Content-Length: ${Buffer.byteLength(payload)}\r\n` +
+      "Connection: close\r\n" +
+      "\r\n" +
+      payload,
+  );
+  socket.destroy();
 };
 
 const start = async () => {
@@ -180,6 +482,30 @@ const start = async () => {
     }
   };
 
+  const restartGatewayContainer = async (containerId: string) => {
+    if (!adminDocker) {
+      return false;
+    }
+    try {
+      await adminDocker.getContainer(containerId).restart();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const waitForGatewayRuntime = async (containerId: string, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const runtime = await inspectGatewayRuntime(containerId);
+      if (runtime?.running && runtime.ip) {
+        return runtime;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return null;
+  };
+
   const startSessionFlow = (sessionId: string, authDir: string) => {
     if (activeSessions.has(sessionId)) {
       return;
@@ -207,10 +533,11 @@ const start = async () => {
           message: "Deploying your agent.",
         });
         const existingAgent = await store.getAgentByUserId(linked.userId);
-        if (!existingAgent) {
-          await store.createAgentForUser(linked.userId, defaultAgentSettings());
-        }
-        await provisioner.provision(linked.userId, authDir, linked.whatsappId);
+        const agentSettings =
+          existingAgent ?? (await store.createAgentForUser(linked.userId, defaultAgentSettings()));
+        await provisioner.provision(linked.userId, authDir, linked.whatsappId, {
+          modelTier: agentSettings.modelTier,
+        });
         await store.updateLoginSession(sessionId, { state: "ready" });
         events.emit(sessionId, {
           type: "status",
@@ -232,6 +559,35 @@ const start = async () => {
     })();
     activeSessions.set(sessionId, task);
     task.finally(() => activeSessions.delete(sessionId));
+  };
+
+  const closeUserSessions = async (userId: string) => {
+    const sessions = await store.listLoginSessions();
+    let closed = 0;
+    for (const session of sessions) {
+      if (session.userId !== userId) {
+        continue;
+      }
+      if (session.state === "expired" || session.state === "error") {
+        continue;
+      }
+      const updated = await store.updateLoginSession(session.id, {
+        state: "expired",
+        errorCode: "SESSION_EXPIRED",
+        errorMessage: "Session closed by admin.",
+      });
+      if (!updated) {
+        continue;
+      }
+      closed += 1;
+      sessionUsers.delete(session.id);
+      events.emit(session.id, {
+        type: "status",
+        state: "expired",
+        message: "Session closed by admin.",
+      });
+    }
+    return closed;
   };
 
   const app = express();
@@ -292,6 +648,12 @@ const start = async () => {
         runtimeByContainerId.set(containerId, await inspectGatewayRuntime(containerId));
       }),
     );
+    const gatewayTokenByGatewayId = new Map<string, string | null>();
+    await Promise.all(
+      sortedGateways.map(async (gateway) => {
+        gatewayTokenByGatewayId.set(gateway.id, await readGatewayTokenFromConfig(gateway.authDirPath));
+      }),
+    );
 
     const usersSummary = users.map((user) => {
       const agent = agentByUserId.get(user.id) ?? null;
@@ -328,6 +690,7 @@ const start = async () => {
               runtimeStatus: runtime?.status ?? null,
               runtimeRunning: runtime?.running ?? null,
               runtimeIp: runtime?.ip ?? null,
+              gatewayToken: gatewayTokenByGatewayId.get(gateway.id) ?? null,
               proxyBasePath,
               canvasPath: proxyBasePath ? `${proxyBasePath}__openclaw__/canvas/` : null,
             }
@@ -372,6 +735,7 @@ const start = async () => {
         runtimeStatus: runtime?.status ?? null,
         runtimeRunning: runtime?.running ?? null,
         runtimeIp: runtime?.ip ?? null,
+        gatewayToken: gatewayTokenByGatewayId.get(gateway.id) ?? null,
         proxyBasePath,
         canvasPath: `${proxyBasePath}__openclaw__/canvas/`,
       };
@@ -402,6 +766,36 @@ const start = async () => {
     });
   });
 
+  app.post("/v1/admin/users/:userId/deprovision", requireAdmin, async (req, res) => {
+    const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+    if (!userId) {
+      res.status(400).json({ error: "invalid_user_id" });
+      return;
+    }
+
+    try {
+      const sessionsClosed = await closeUserSessions(userId);
+      const gateway = await store.getGatewayInstanceByUserId(userId);
+      const deprovisionedGateway = gateway ? await provisioner.deprovision(gateway) : null;
+
+      res.json({
+        ok: true,
+        userId,
+        sessionsClosed,
+        gateway: gateway
+          ? {
+              id: gateway.id,
+              hadContainer: Boolean(gateway.containerId),
+              status: deprovisionedGateway?.status ?? gateway.status,
+              containerId: deprovisionedGateway?.containerId ?? gateway.containerId,
+            }
+          : null,
+      });
+    } catch {
+      res.status(500).json({ error: "deprovision_failed" });
+    }
+  });
+
   app.use("/admin/openclaw/:userId", requireAdmin, async (req, res) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       res.status(405).json({ error: "method_not_allowed" });
@@ -424,24 +818,35 @@ const start = async () => {
       return;
     }
 
-    const runtime = await inspectGatewayRuntime(gateway.containerId);
-    if (!runtime?.running || !runtime.ip) {
-      res.status(503).json({ error: "gateway_not_running" });
-      return;
-    }
-
-    const requestedPath = req.url && req.url.length > 0 ? req.url : "/";
-    const targetUrl = `http://${runtime.ip}:18789${requestedPath.startsWith("/") ? requestedPath : `/${requestedPath}`}`;
-
     try {
       const acceptHeader = getProxyHeaderValue(req.headers.accept);
-      const gatewayToken = await readGatewayTokenFromConfig(gateway.authDirPath);
+      const hostOrigin = buildHostOrigin(
+        req.get("host"),
+        req.protocol === "https" ? "https" : "http",
+      );
+      const configState = await ensureGatewayControlUiConfig(gateway.authDirPath, [
+        req.header("origin"),
+        hostOrigin,
+      ]);
+      if (configState.changed) {
+        await restartGatewayContainer(gateway.containerId);
+      }
+      const runtime = configState.changed
+        ? await waitForGatewayRuntime(gateway.containerId)
+        : await inspectGatewayRuntime(gateway.containerId);
+      if (!runtime?.running || !runtime.ip) {
+        res.status(503).json({ error: "gateway_not_running" });
+        return;
+      }
+
+      const requestedPath = req.url && req.url.length > 0 ? req.url : "/";
+      const targetUrl = `http://${runtime.ip}:18789${requestedPath.startsWith("/") ? requestedPath : `/${requestedPath}`}`;
       const headers: Record<string, string> = {};
       if (acceptHeader) {
         headers.accept = acceptHeader;
       }
-      if (gatewayToken) {
-        headers.authorization = `Bearer ${gatewayToken}`;
+      if (configState.token) {
+        headers.authorization = `Bearer ${configState.token}`;
       }
       const upstream = await fetch(targetUrl, {
         method: req.method,
@@ -587,10 +992,18 @@ const start = async () => {
     }
     const gateway = await store.getGatewayInstanceByUserId(userId);
     let gatewayStatus = gateway?.status ?? null;
-    if (gateway && provisioner instanceof DockerProvisioner) {
-      const refreshed = await provisioner.refreshInstance(gateway);
-      gatewayStatus = refreshed?.status ?? gatewayStatus;
+    if (gateway) {
+      const modelConfig = await ensureGatewayAgentModelConfig(gateway.authDirPath, agent.modelTier);
+      if (modelConfig.changed && gateway.containerId) {
+        await restartGatewayContainer(gateway.containerId);
+        await waitForGatewayRuntime(gateway.containerId);
+      }
+      if (provisioner instanceof DockerProvisioner) {
+        const refreshed = await provisioner.refreshInstance(gateway);
+        gatewayStatus = refreshed?.status ?? gatewayStatus;
+      }
     }
+    const gatewayToken = gateway ? await readGatewayTokenFromConfig(gateway.authDirPath) : null;
     res.json({
       agentId: agent.id,
       status: "running",
@@ -600,6 +1013,7 @@ const start = async () => {
       language: agent.language,
       allowlistOnly: agent.allowlistOnly,
       gatewayStatus,
+      gatewayToken,
     });
   });
 
@@ -625,6 +1039,17 @@ const start = async () => {
       res.status(404).json({ error: "not_found" });
       return;
     }
+    const gateway = await store.getGatewayInstanceByUserId(userId);
+    if (gateway) {
+      const modelConfig = await ensureGatewayAgentModelConfig(gateway.authDirPath, next.modelTier);
+      if (modelConfig.changed && gateway.containerId) {
+        await restartGatewayContainer(gateway.containerId);
+        await waitForGatewayRuntime(gateway.containerId);
+        if (provisioner instanceof DockerProvisioner) {
+          await provisioner.refreshInstance(gateway);
+        }
+      }
+    }
     res.json({
       agentId: next.id,
       status: "running",
@@ -636,9 +1061,186 @@ const start = async () => {
     });
   });
 
-  app.listen(deployConfig.port, () => {
+  const server = app.listen(deployConfig.port, () => {
     // eslint-disable-next-line no-console
     console.log(`Deploy web listening on ${baseUrl}`);
+  });
+
+  server.on("upgrade", (req, socket, head) => {
+    void (async () => {
+      const parsed = parseAdminProxyUrl(req.url);
+      if (!parsed) {
+        socket.destroy();
+        return;
+      }
+
+      if (isAdminDisabled()) {
+        writeUpgradeJsonError(socket, 404, { error: "not_found" });
+        return;
+      }
+      if (adminToken) {
+        const candidate = getAdminTokenFromIncomingRequest(req);
+        if (candidate !== adminToken) {
+          writeUpgradeJsonError(socket, 401, { error: "unauthorized" });
+          return;
+        }
+      }
+      if (!adminDocker) {
+        writeUpgradeJsonError(socket, 400, { error: "docker_provisioner_required" });
+        return;
+      }
+
+      const gateway = await store.getGatewayInstanceByUserId(parsed.userId);
+      if (!gateway || !gateway.containerId) {
+        writeUpgradeJsonError(socket, 404, { error: "not_found" });
+        return;
+      }
+
+      const requestOrigin = getProxyHeaderValue(req.headers.origin);
+      let protocolHint: "http" | "https" = "http";
+      const normalizedRequestOrigin = normalizeOrigin(requestOrigin);
+      if (normalizedRequestOrigin?.startsWith("https://")) {
+        protocolHint = "https";
+      }
+      const hostOrigin = buildHostOrigin(getProxyHeaderValue(req.headers.host), protocolHint);
+      const configState = await ensureGatewayControlUiConfig(gateway.authDirPath, [
+        requestOrigin,
+        hostOrigin,
+      ]);
+      if (configState.changed) {
+        await restartGatewayContainer(gateway.containerId);
+      }
+      const runtime = configState.changed
+        ? await waitForGatewayRuntime(gateway.containerId)
+        : await inspectGatewayRuntime(gateway.containerId);
+      if (!runtime?.running || !runtime.ip) {
+        writeUpgradeJsonError(socket, 503, { error: "gateway_not_running" });
+        return;
+      }
+      const upstreamHeaders: Record<string, string | string[]> = {};
+      const originalHost = getProxyHeaderValue(req.headers.host);
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (!value) {
+          continue;
+        }
+        const lower = key.toLowerCase();
+        if (
+          lower === "host" ||
+          lower === "x-admin-token" ||
+          lower === "authorization" ||
+          lower === "content-length"
+        ) {
+          continue;
+        }
+        upstreamHeaders[key] = value;
+      }
+      if (originalHost) {
+        upstreamHeaders.host = originalHost;
+      }
+      if (configState.token) {
+        upstreamHeaders.authorization = `Bearer ${configState.token}`;
+      }
+
+      let finalized = false;
+      const fail = (statusCode: number, payload: unknown) => {
+        if (finalized) {
+          return;
+        }
+        finalized = true;
+        writeUpgradeJsonError(socket, statusCode, payload);
+      };
+
+      const upstreamReq = httpRequest({
+        host: runtime.ip,
+        port: 18789,
+        method: req.method ?? "GET",
+        path: parsed.targetPath,
+        setHost: false,
+        headers: upstreamHeaders,
+      });
+
+      upstreamReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+        if (finalized) {
+          upstreamSocket.destroy();
+          return;
+        }
+        finalized = true;
+        const statusCode = upstreamRes.statusCode ?? 101;
+        const statusText = upstreamRes.statusMessage ?? STATUS_CODES[statusCode] ?? "Switching Protocols";
+        socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\n`);
+        for (const [key, value] of Object.entries(upstreamRes.headers)) {
+          if (!value) {
+            continue;
+          }
+          if (Array.isArray(value)) {
+            for (const entry of value) {
+              socket.write(`${key}: ${entry}\r\n`);
+            }
+          } else {
+            socket.write(`${key}: ${value}\r\n`);
+          }
+        }
+        socket.write("\r\n");
+        if (upstreamHead.length > 0) {
+          socket.write(upstreamHead);
+        }
+        if (head.length > 0) {
+          upstreamSocket.write(head);
+        }
+        upstreamSocket.pipe(socket);
+        socket.pipe(upstreamSocket);
+        upstreamSocket.on("error", () => socket.destroy());
+        socket.on("error", () => upstreamSocket.destroy());
+      });
+
+      upstreamReq.on("response", async (upstreamRes) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of upstreamRes) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        if (finalized) {
+          return;
+        }
+        finalized = true;
+        const body = Buffer.concat(chunks);
+        const statusCode = upstreamRes.statusCode ?? 502;
+        const statusText = upstreamRes.statusMessage ?? STATUS_CODES[statusCode] ?? "Bad Gateway";
+        socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\n`);
+        for (const [key, value] of Object.entries(upstreamRes.headers)) {
+          if (!value) {
+            continue;
+          }
+          const lower = key.toLowerCase();
+          if (
+            lower === "connection" ||
+            lower === "transfer-encoding" ||
+            lower === "keep-alive" ||
+            lower === "content-length"
+          ) {
+            continue;
+          }
+          if (Array.isArray(value)) {
+            for (const entry of value) {
+              socket.write(`${key}: ${entry}\r\n`);
+            }
+          } else {
+            socket.write(`${key}: ${value}\r\n`);
+          }
+        }
+        socket.write(`Content-Length: ${body.length}\r\n`);
+        socket.write("Connection: close\r\n");
+        socket.write("\r\n");
+        if (body.length > 0) {
+          socket.write(body);
+        }
+        socket.destroy();
+      });
+
+      upstreamReq.on("error", () => fail(502, { error: "upstream_unreachable" }));
+      upstreamReq.end();
+    })().catch(() => {
+      writeUpgradeJsonError(socket, 500, { error: "proxy_failure" });
+    });
   });
 
   const shutdown = () => {

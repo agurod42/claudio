@@ -4,8 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { deployConfig } from "./config.js";
 import type { DeployStore } from "./store.js";
-import type { GatewayInstanceRecord } from "./types.js";
-import type { Provisioner } from "./provisioner.js";
+import type { GatewayInstanceRecord, ModelTier } from "./types.js";
+import type { ProvisionOptions, Provisioner } from "./provisioner.js";
 
 const AUTH_MOUNT_PATH = "/data/auth";
 const SHARED_AUTH_MOUNT_PATH = "/data/auth-shared";
@@ -34,11 +34,79 @@ const GATEWAY_ENV_PASSTHROUGH = [
   "CEREBRAS_API_KEY",
 ] as const;
 
-const buildConfig = (authDir: string, whatsappId: string, gatewayToken: string) => ({
+const DEFAULT_TOOLS_PROFILE = "minimal";
+
+const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
+  best: "groq/llama-3.3-70b-versatile",
+  fast: "groq/llama-3.1-8b-instant",
+  premium: "groq/llama-3.3-70b-versatile",
+};
+
+const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
+  best: ["groq/llama-3.1-8b-instant"],
+  fast: ["groq/llama-3.3-70b-versatile"],
+  premium: ["groq/llama-3.1-8b-instant"],
+};
+
+const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
+  // Keep context conservative to stay under Groq per-request TPM limits.
+  best: 16_000,
+  fast: 16_000,
+  premium: 16_000,
+};
+
+const normalizeOrigin = (value: string | null | undefined) => {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return null;
+  }
+};
+
+const resolveControlUiAllowedOrigins = () => {
+  const candidates = [
+    deployConfig.baseUrl,
+    `http://localhost:${deployConfig.port}`,
+    `http://127.0.0.1:${deployConfig.port}`,
+    `http://[::1]:${deployConfig.port}`,
+  ];
+  const unique = new Set<string>();
+  for (const candidate of candidates) {
+    const origin = normalizeOrigin(candidate);
+    if (origin) {
+      unique.add(origin);
+    }
+  }
+  return Array.from(unique);
+};
+
+const resolvePrimaryModel = (modelTier: ModelTier | undefined) =>
+  MODEL_PRIMARY_BY_TIER[modelTier ?? "best"] ?? MODEL_PRIMARY_BY_TIER.best;
+
+const resolveModelFallbacks = (modelTier: ModelTier | undefined) =>
+  [...(MODEL_FALLBACKS_BY_TIER[modelTier ?? "best"] ?? MODEL_FALLBACKS_BY_TIER.best)];
+
+const resolveContextTokens = (modelTier: ModelTier | undefined) =>
+  MODEL_CONTEXT_TOKENS_BY_TIER[modelTier ?? "best"] ?? MODEL_CONTEXT_TOKENS_BY_TIER.best;
+
+const buildConfig = (
+  authDir: string,
+  whatsappId: string,
+  gatewayToken: string,
+  modelTier?: ModelTier,
+) => ({
   gateway: {
     auth: {
       mode: "token",
       token: gatewayToken,
+    },
+    controlUi: {
+      allowInsecureAuth: true,
+      allowedOrigins: resolveControlUiAllowedOrigins(),
     },
   },
   channels: {
@@ -53,6 +121,25 @@ const buildConfig = (authDir: string, whatsappId: string, gatewayToken: string) 
       },
     },
   },
+  plugins: {
+    entries: {
+      whatsapp: {
+        enabled: true,
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      contextTokens: resolveContextTokens(modelTier),
+      model: {
+        primary: resolvePrimaryModel(modelTier),
+        fallbacks: resolveModelFallbacks(modelTier),
+      },
+    },
+  },
+  tools: {
+    profile: DEFAULT_TOOLS_PROFILE,
+  },
 });
 
 const ensureConfigFile = async (
@@ -60,9 +147,10 @@ const ensureConfigFile = async (
   gatewayAuthDir: string,
   whatsappId: string,
   gatewayToken: string,
+  modelTier?: ModelTier,
 ) => {
   await fs.mkdir(hostAuthDir, { recursive: true });
-  const config = buildConfig(gatewayAuthDir, whatsappId, gatewayToken);
+  const config = buildConfig(gatewayAuthDir, whatsappId, gatewayToken, modelTier);
   const configPath = path.join(hostAuthDir, CONFIG_FILENAME);
   await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
   return configPath;
@@ -132,11 +220,22 @@ export class DockerProvisioner implements Provisioner {
     };
   }
 
-  async provision(userId: string, authDir: string, whatsappId: string): Promise<GatewayInstanceRecord> {
+  async provision(
+    userId: string,
+    authDir: string,
+    whatsappId: string,
+    options?: ProvisionOptions,
+  ): Promise<GatewayInstanceRecord> {
     const instance = await this.store.createGatewayInstanceForUser(userId, authDir);
     const gatewayToken = randomBytes(24).toString("hex");
     const gatewayPaths = resolveGatewayPaths(authDir, this.opts.authVolume);
-    await ensureConfigFile(authDir, gatewayPaths.gatewayAuthDir, whatsappId, gatewayToken);
+    await ensureConfigFile(
+      authDir,
+      gatewayPaths.gatewayAuthDir,
+      whatsappId,
+      gatewayToken,
+      options?.modelTier,
+    );
     await this.ensureGatewayAuthOwnership(authDir);
     const containerName = resolveContainerName(this.opts.containerPrefix, userId);
 
@@ -179,6 +278,17 @@ export class DockerProvisioner implements Provisioner {
       status: "running",
     });
     return updated ?? instance;
+  }
+
+  async deprovision(instance: GatewayInstanceRecord): Promise<GatewayInstanceRecord | null> {
+    if (instance.containerId) {
+      try {
+        await this.docker.getContainer(instance.containerId).remove({ force: true });
+      } catch {
+        // ignore
+      }
+    }
+    return await this.store.updateGatewayInstanceStatus(instance.id, "stopped", null);
   }
 
   private async ensureGatewayAuthOwnership(authDir: string): Promise<void> {

@@ -12,6 +12,7 @@ services:
 
   deploy:
     build: .
+    command: ["node", "--watch", "--import", "tsx", "src/deploy/server.ts"]
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
@@ -36,6 +37,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
+      - ./src:/app/src
       - clawdly_auth:/data/auth
       # Linux/macOS: allow Docker provisioner to start gateway containers
       - /var/run/docker.sock:/var/run/docker.sock

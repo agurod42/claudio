@@ -17,6 +17,8 @@ let currentSessionId = null;
 let currentUserId = null;
 let eventSource = null;
 let authToken = localStorage.getItem("clawdly_auth") || null;
+let redirectInFlight = false;
+let redirectedToGateway = false;
 
 const showScreen = (name) => {
   Object.values(screens).forEach((screen) => screen.classList.remove("screen-active"));
@@ -28,6 +30,37 @@ const showScreen = (name) => {
   const next = screens[name];
   if (next) {
     next.classList.add("screen-active");
+  }
+};
+
+const buildGatewayRootPath = (userId, gatewayToken) => {
+  if (!userId) {
+    return null;
+  }
+  const proxyBasePath = `/admin/openclaw/${encodeURIComponent(userId)}/`;
+  const rootUrl = new URL(proxyBasePath, window.location.origin);
+  const wsUrl = new URL(proxyBasePath, window.location.origin);
+  wsUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  rootUrl.searchParams.set("gatewayUrl", wsUrl.toString());
+  if (gatewayToken) {
+    rootUrl.searchParams.set("token", gatewayToken);
+  }
+  return `${rootUrl.pathname}${rootUrl.search}`;
+};
+
+const redirectToGateway = (gatewayPath) => {
+  if (!gatewayPath || redirectedToGateway || redirectInFlight) {
+    return;
+  }
+  redirectedToGateway = true;
+  redirectInFlight = true;
+  try {
+    const opened = window.open(gatewayPath, "_blank", "noopener");
+    if (!opened) {
+      window.location.assign(gatewayPath);
+    }
+  } finally {
+    redirectInFlight = false;
   }
 };
 
@@ -118,7 +151,7 @@ const connectStream = (url) => {
     }
     if (state === "ready") {
       showScreen("success");
-      loadUserAndAgent();
+      void loadUserAndAgent({ redirectIfGatewayRunning: true });
     }
   });
   eventSource.addEventListener("auth", (event) => {
@@ -126,6 +159,7 @@ const connectStream = (url) => {
     if (data && data.token) {
       authToken = data.token;
       localStorage.setItem("clawdly_auth", data.token);
+      void loadUserAndAgent({ redirectIfGatewayRunning: true });
     }
   });
   eventSource.addEventListener("error", (event) => {
@@ -144,6 +178,8 @@ const startSession = async () => {
   setExpiry(null);
   showScreen("pairing");
   currentUserId = null;
+  redirectedToGateway = false;
+  redirectInFlight = false;
   authToken = null;
   localStorage.removeItem("clawdly_auth");
   try {
@@ -159,7 +195,7 @@ const startSession = async () => {
   }
 };
 
-const loadUserAndAgent = async () => {
+const loadUserAndAgent = async ({ redirectIfGatewayRunning = false } = {}) => {
   if (!currentSessionId) {
     return;
   }
@@ -183,6 +219,15 @@ const loadUserAndAgent = async () => {
       return;
     }
     const agent = await agentResp.json();
+    if (redirectIfGatewayRunning && !redirectedToGateway && !redirectInFlight) {
+      if (agent.gatewayStatus === "running") {
+        const gatewayPath = buildGatewayRootPath(currentUserId, agent.gatewayToken);
+        if (gatewayPath) {
+          redirectToGateway(gatewayPath);
+          return;
+        }
+      }
+    }
     if (!customizeForm) {
       return;
     }
@@ -198,6 +243,48 @@ const loadUserAndAgent = async () => {
     if (allowlistField) allowlistField.checked = agent.allowlistOnly !== false;
   } catch {
     // ignore
+  } finally {
+    redirectInFlight = false;
+  }
+};
+
+const maybeResumeAndRedirect = async () => {
+  if (!authToken || redirectedToGateway || redirectInFlight) {
+    return;
+  }
+  try {
+    const meResp = await fetch("/v1/me", {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!meResp.ok) {
+      authToken = null;
+      localStorage.removeItem("clawdly_auth");
+      return;
+    }
+    const me = await meResp.json();
+    currentUserId = me.userId || null;
+    if (!currentUserId) {
+      return;
+    }
+    const agentResp = await fetch("/v1/agent", {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!agentResp.ok) {
+      return;
+    }
+    const agent = await agentResp.json();
+    if (agent.gatewayStatus !== "running") {
+      return;
+    }
+    const gatewayPath = buildGatewayRootPath(currentUserId, agent.gatewayToken);
+    if (!gatewayPath) {
+      return;
+    }
+    redirectToGateway(gatewayPath);
+  } catch {
+    // ignore
+  } finally {
+    redirectInFlight = false;
   }
 };
 
@@ -272,3 +359,4 @@ const setupActions = () => {
 
 setupActions();
 showScreen("landing");
+void maybeResumeAndRedirect();

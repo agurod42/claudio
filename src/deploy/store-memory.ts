@@ -173,7 +173,7 @@ export class MemoryStore implements DeployStore {
     const next: GatewayInstanceRecord = {
       ...existing,
       status,
-      containerId: containerId ?? existing.containerId,
+      containerId: containerId === undefined ? existing.containerId : containerId,
     };
     this.gateways.set(id, next);
     return next;

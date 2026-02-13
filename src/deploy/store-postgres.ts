@@ -286,9 +286,17 @@ export class PostgresStore implements DeployStore {
     status: GatewayInstanceRecord["status"],
     containerId?: string | null,
   ): Promise<GatewayInstanceRecord | null> {
+    const fields = ["status = $1"];
+    const values: unknown[] = [status];
+    let idx = 2;
+    if (containerId !== undefined) {
+      fields.push(`container_id = $${idx++}`);
+      values.push(containerId);
+    }
+    values.push(id);
     const result = await this.pool.query(
-      "update gateway_instances set status = $1, container_id = $2 where id = $3 returning *",
-      [status, containerId ?? null, id],
+      `update gateway_instances set ${fields.join(", ")} where id = $${idx} returning *`,
+      values,
     );
     if (!result.rowCount) {
       return null;

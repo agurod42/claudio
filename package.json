@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --import tsx src/deploy/server.ts",
+    "dev:watch": "node --watch --import tsx src/deploy/server.ts",
     "start": "node --import tsx src/deploy/server.ts"
   },
   "dependencies": {

@@ -8,8 +8,6 @@ const els = {
   statsCards: document.getElementById("stats-cards"),
   userSearch: document.getElementById("user-search"),
   usersBody: document.getElementById("users-body"),
-  gatewaysCount: document.getElementById("gateways-count"),
-  gatewaysBody: document.getElementById("gateways-body"),
   sessionSearch: document.getElementById("session-search"),
   sessionState: document.getElementById("session-state"),
   sessionsBody: document.getElementById("sessions-body"),
@@ -18,10 +16,10 @@ const els = {
 const state = {
   authMode: "token",
   users: [],
-  gateways: [],
   sessions: [],
   stats: {},
 };
+const deprovisioningUsers = new Set();
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -45,6 +43,11 @@ const formatDate = (iso) => {
 const getToken = () => {
   const value = localStorage.getItem(STORAGE_KEY);
   return value && value.trim().length > 0 ? value.trim() : "";
+};
+
+const getAdminHeaders = () => {
+  const token = getToken();
+  return token ? { "x-admin-token": token } : {};
 };
 
 const setStatusText = (message) => {
@@ -71,6 +74,24 @@ const addTokenToPath = (path) => {
   return `${url.pathname}${url.search}`;
 };
 
+const buildGatewayRootPath = (proxyBasePath, gatewayToken) => {
+  if (!proxyBasePath) {
+    return null;
+  }
+  const adminToken = getToken();
+  const rootUrl = new URL(addTokenToPath(proxyBasePath), window.location.origin);
+  const wsUrl = new URL(proxyBasePath, window.location.origin);
+  wsUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  if (adminToken) {
+    wsUrl.searchParams.set("adminToken", adminToken);
+  }
+  rootUrl.searchParams.set("gatewayUrl", wsUrl.toString());
+  if (gatewayToken) {
+    rootUrl.searchParams.set("token", gatewayToken);
+  }
+  return `${rootUrl.pathname}${rootUrl.search}`;
+};
+
 const renderStats = () => {
   if (!els.statsCards) {
     return;
@@ -78,12 +99,10 @@ const renderStats = () => {
   const cards = [
     ["Users", state.stats.usersTotal ?? 0],
     ["Active Users", state.stats.usersActive ?? 0],
-    ["Gateways", state.stats.gatewaysTotal ?? 0],
     ["Gateways Running", state.stats.gatewaysRunning ?? 0],
     ["Session Total", state.stats.sessionsTotal ?? 0],
     ["Session Ready", state.stats.sessionsReady ?? 0],
     ["Session Errors", state.stats.sessionsError ?? 0],
-    ["Session Waiting", state.stats.sessionsWaiting ?? 0],
   ];
   els.statsCards.innerHTML = cards
     .map(
@@ -131,8 +150,8 @@ const renderUsers = () => {
 
   els.usersBody.innerHTML = filtered
     .map((user) => {
+      const rootPath = buildGatewayRootPath(user.gateway?.proxyBasePath, user.gateway?.gatewayToken);
       const canvasPath = user.gateway?.canvasPath ? addTokenToPath(user.gateway.canvasPath) : null;
-      const proxyPath = user.gateway?.proxyBasePath ? addTokenToPath(user.gateway.proxyBasePath) : null;
       const agentText = user.agent
         ? `${escapeHtml(user.agent.name || "Unnamed")} · ${escapeHtml(user.agent.modelTier)}`
         : "Not created";
@@ -143,27 +162,48 @@ const renderUsers = () => {
               : ""
           }`
         : `<span class="subtle">None</span>`;
+      const gatewayDetails = user.gateway
+        ? `<details class="inline-details">
+            <summary>Gateway details</summary>
+            <div class="details-grid">
+              <div><span class="subtle">Auth dir</span><div class="mono">${escapeHtml(user.gateway.authDirPath || "n/a")}</div></div>
+              <div><span class="subtle">Created</span><div>${formatDate(user.gateway.createdAt)}</div></div>
+              <div><span class="subtle">Runtime IP</span><div class="mono">${escapeHtml(user.gateway.runtimeIp || "n/a")}</div></div>
+            </div>
+          </details>`
+        : "";
       const gateway = user.gateway
         ? `${statusBadge(user.gateway.status)}
             <div class="mono">${escapeHtml(user.gateway.id)}</div>
             <div class="subtle">container: ${escapeHtml(user.gateway.containerId || "n/a")}</div>
-            <div class="subtle">runtime: ${escapeHtml(user.gateway.runtimeStatus || "unknown")}</div>`
+            <div class="subtle">runtime: ${escapeHtml(user.gateway.runtimeStatus || "unknown")}</div>
+            ${gatewayDetails}`
         : `<span class="subtle">Not provisioned</span>`;
-      const actions =
-        canvasPath || proxyPath
-          ? `<div class="actions-row">
-              ${
-                canvasPath
-                  ? `<a class="mini-link" href="${escapeHtml(canvasPath)}" target="_blank" rel="noreferrer">Canvas</a>`
-                  : ""
-              }
-              ${
-                proxyPath
-                  ? `<a class="mini-link" href="${escapeHtml(proxyPath)}" target="_blank" rel="noreferrer">Gateway Root</a>`
-                  : ""
-              }
-            </div>`
-          : `<span class="subtle">No connect link</span>`;
+      const deprovisionBusy = deprovisioningUsers.has(user.userId);
+      const deprovisionLabel = user.gateway?.containerId
+        ? "Close Session + Deprovision"
+        : "Close Session";
+      const actions = `<div class="actions-row">
+          ${
+            rootPath
+              ? `<a class="mini-link" href="${escapeHtml(rootPath)}" target="_blank" rel="noreferrer">Gateway Root</a>`
+              : ""
+          }
+          ${
+            canvasPath
+              ? `<a class="mini-link" href="${escapeHtml(canvasPath)}" target="_blank" rel="noreferrer">Canvas</a>`
+              : ""
+          }
+          <button
+            type="button"
+            class="mini-btn mini-btn-danger"
+            data-action="deprovision-user"
+            data-user-id="${escapeHtml(user.userId)}"
+            ${deprovisionBusy ? "disabled" : ""}
+          >
+            ${escapeHtml(deprovisionBusy ? "Working..." : deprovisionLabel)}
+          </button>
+        </div>`;
       return `
         <tr>
           <td>
@@ -189,44 +229,6 @@ const renderUsers = () => {
           <td>${actions}</td>
         </tr>
       `;
-    })
-    .join("");
-};
-
-const renderGateways = () => {
-  if (!els.gatewaysBody) {
-    return;
-  }
-  if (els.gatewaysCount) {
-    els.gatewaysCount.textContent = `${state.gateways.length} records`;
-  }
-  if (state.gateways.length === 0) {
-    els.gatewaysBody.innerHTML = `<tr><td class="empty" colspan="7">No gateway instances yet.</td></tr>`;
-    return;
-  }
-  els.gatewaysBody.innerHTML = state.gateways
-    .map((gateway) => {
-      const canvasPath = gateway.canvasPath ? addTokenToPath(gateway.canvasPath) : null;
-      return `
-      <tr>
-        <td class="mono">${escapeHtml(gateway.id)}</td>
-        <td class="mono">${escapeHtml(gateway.userId)}</td>
-        <td>${statusBadge(gateway.status)}</td>
-        <td>
-          <div class="mono">${escapeHtml(gateway.containerId || "n/a")}</div>
-          <div class="subtle">${escapeHtml(gateway.runtimeStatus || "unknown")}</div>
-        </td>
-        <td class="mono">${escapeHtml(gateway.authDirPath)}</td>
-        <td>${formatDate(gateway.createdAt)}</td>
-        <td>
-          ${
-            canvasPath
-              ? `<a class="mini-link" href="${escapeHtml(canvasPath)}" target="_blank" rel="noreferrer">Open Canvas</a>`
-              : `<span class="subtle">Unavailable</span>`
-          }
-        </td>
-      </tr>
-    `;
     })
     .join("");
 };
@@ -291,8 +293,60 @@ const renderSessions = () => {
 const renderAll = () => {
   renderStats();
   renderUsers();
-  renderGateways();
   renderSessions();
+};
+
+const runDeprovision = async (userId) => {
+  if (!userId || deprovisioningUsers.has(userId)) {
+    return;
+  }
+  const user = state.users.find((entry) => entry.userId === userId);
+  const userLabel = user?.whatsappId || userId;
+  const confirmed = window.confirm(
+    `Close active session and deprovision ${userLabel}? This will stop and remove the user's gateway container.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  deprovisioningUsers.add(userId);
+  renderUsers();
+  setStatusText(`Deprovisioning ${userLabel}...`);
+
+  try {
+    const resp = await fetch(`/v1/admin/users/${encodeURIComponent(userId)}/deprovision`, {
+      method: "POST",
+      headers: getAdminHeaders(),
+    });
+    if (resp.status === 401) {
+      setStatusText("Unauthorized. Save a valid admin token, then refresh.");
+      return;
+    }
+    if (resp.status === 404) {
+      setStatusText("Admin dashboard is disabled in production without OPENCLAW_DEPLOY_ADMIN_TOKEN.");
+      return;
+    }
+    if (!resp.ok) {
+      setStatusText(`Could not deprovision ${userLabel} (HTTP ${resp.status}).`);
+      return;
+    }
+
+    const data = await resp.json();
+    const sessionsClosed =
+      data && typeof data.sessionsClosed === "number" ? data.sessionsClosed : 0;
+    const hadContainer = Boolean(data?.gateway?.hadContainer);
+    await loadOverview();
+    setStatusText(
+      `Deprovisioned ${userLabel}. Closed ${sessionsClosed} session${sessionsClosed === 1 ? "" : "s"}${
+        hadContainer ? "; gateway container removed." : "."
+      }`,
+    );
+  } catch {
+    setStatusText(`Failed to deprovision ${userLabel}. Check server logs.`);
+  } finally {
+    deprovisioningUsers.delete(userId);
+    renderUsers();
+  }
 };
 
 const loadOverview = async () => {
@@ -303,7 +357,7 @@ const loadOverview = async () => {
   }
   try {
     const resp = await fetch("/v1/admin/overview", {
-      headers: token ? { "x-admin-token": token } : {},
+      headers: getAdminHeaders(),
     });
     if (resp.status === 401) {
       setStatusText("Unauthorized. Save a valid admin token, then refresh.");
@@ -320,7 +374,6 @@ const loadOverview = async () => {
     const data = await resp.json();
     state.authMode = data.authMode || "token";
     state.users = Array.isArray(data.users) ? data.users : [];
-    state.gateways = Array.isArray(data.gateways) ? data.gateways : [];
     state.sessions = Array.isArray(data.sessions) ? data.sessions : [];
     state.stats = data.stats || {};
     renderAll();
@@ -358,6 +411,24 @@ const setup = () => {
   }
   if (els.sessionState) {
     els.sessionState.addEventListener("change", renderSessions);
+  }
+  const onDeprovisionClick = (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest('button[data-action="deprovision-user"]');
+    if (!(button instanceof HTMLButtonElement)) {
+      return;
+    }
+    const userId = button.dataset.userId?.trim();
+    if (!userId) {
+      return;
+    }
+    void runDeprovision(userId);
+  };
+  if (els.usersBody) {
+    els.usersBody.addEventListener("click", onDeprovisionClick);
   }
 };
 

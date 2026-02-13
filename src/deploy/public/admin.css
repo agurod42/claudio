@@ -232,6 +232,22 @@ th {
   flex-wrap: wrap;
 }
 
+.inline-details {
+  margin-top: 8px;
+}
+
+.inline-details summary {
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.details-grid {
+  margin-top: 6px;
+  display: grid;
+  gap: 6px;
+}
+
 .mini-link {
   display: inline-block;
   border: 1px solid var(--border);
@@ -240,6 +256,27 @@ th {
   text-decoration: none;
   color: inherit;
   font-size: 12px;
+}
+
+.mini-btn {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: #fff;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.mini-btn-danger {
+  border-color: #e8bdc4;
+  background: #fff7f8;
+  color: var(--bad);
+}
+
+.mini-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .empty {
