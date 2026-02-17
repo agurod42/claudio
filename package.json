@@ -10,13 +10,13 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc.9",
-    "dockerode": "^4.0.2",
+    "dockerode": "^4.0.9",
     "express": "^5.2.1",
     "pg": "^8.13.0",
     "qrcode": "1.5.4"
   },
   "devDependencies": {
-    "@types/dockerode": "^3.3.30",
+    "@types/dockerode": "^3.3.47",
     "@types/express": "^5.0.6",
     "@types/node": "^25.2.1",
     "@types/pg": "^8.10.2",

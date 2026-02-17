@@ -6,14 +6,22 @@ export type ProvisionOptions = {
   modelTier?: ModelTier;
 };
 
+export type ProvisionResult = {
+  instance: GatewayInstanceRecord;
+  healthy: boolean;
+};
+
 export interface Provisioner {
   provision(
     userId: string,
     authDir: string,
     whatsappId: string,
     options?: ProvisionOptions,
-  ): Promise<GatewayInstanceRecord>;
-  deprovision(instance: GatewayInstanceRecord): Promise<GatewayInstanceRecord | null>;
+  ): Promise<ProvisionResult>;
+  deprovision(userId: string): Promise<void>;
+  inspectStatus(userId: string): Promise<GatewayInstanceRecord["status"] | null>;
+  restartContainer(userId: string): Promise<boolean>;
+  reconcile(): Promise<void>;
 }
 
 export class NoopProvisioner implements Provisioner {
@@ -24,13 +32,27 @@ export class NoopProvisioner implements Provisioner {
     authDir: string,
     _whatsappId: string,
     _options?: ProvisionOptions,
-  ): Promise<GatewayInstanceRecord> {
+  ): Promise<ProvisionResult> {
     const instance = await this.store.createGatewayInstanceForUser(userId, authDir);
     const running = await this.store.updateGatewayInstanceStatus(instance.id, "running", null);
-    return running ?? instance;
+    return { instance: running ?? instance, healthy: true };
   }
 
-  async deprovision(instance: GatewayInstanceRecord): Promise<GatewayInstanceRecord | null> {
-    return await this.store.updateGatewayInstanceStatus(instance.id, "stopped", null);
+  async deprovision(userId: string): Promise<void> {
+    const instance = await this.store.getGatewayInstanceByUserId(userId);
+    if (instance) {
+      await this.store.updateGatewayInstanceStatus(instance.id, "stopped", null);
+    }
   }
+
+  async inspectStatus(userId: string): Promise<GatewayInstanceRecord["status"] | null> {
+    const instance = await this.store.getGatewayInstanceByUserId(userId);
+    return instance?.status ?? null;
+  }
+
+  async restartContainer(_userId: string): Promise<boolean> {
+    return false;
+  }
+
+  async reconcile(): Promise<void> {}
 }

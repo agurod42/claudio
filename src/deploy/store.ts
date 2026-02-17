@@ -19,6 +19,7 @@ export type LoginSessionUpdate = {
   errorMessage?: string | null;
   whatsappId?: string | null;
   userId?: string | null;
+  authDir?: string;
 };
 
 export interface DeployStore {
@@ -34,7 +35,11 @@ export interface DeployStore {
   updateAgentSettings(userId: string, update: Partial<AgentSettings>): Promise<AgentRecord | null>;
   getGatewayInstanceByUserId(userId: string): Promise<GatewayInstanceRecord | null>;
   listGatewayInstances(): Promise<GatewayInstanceRecord[]>;
-  createGatewayInstanceForUser(userId: string, authDir: string): Promise<GatewayInstanceRecord>;
+  createGatewayInstanceForUser(
+    userId: string,
+    authDir: string,
+    extra?: { gatewayToken?: string; containerName?: string },
+  ): Promise<GatewayInstanceRecord>;
   updateGatewayInstanceStatus(
     id: string,
     status: GatewayInstanceRecord["status"],

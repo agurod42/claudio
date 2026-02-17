@@ -135,6 +135,7 @@ export class MemoryStore implements DeployStore {
   async createGatewayInstanceForUser(
     userId: string,
     authDir: string,
+    extra?: { gatewayToken?: string; containerName?: string },
   ): Promise<GatewayInstanceRecord> {
     const now = new Date();
     const existing = await this.getGatewayInstanceByUserId(userId);
@@ -144,6 +145,8 @@ export class MemoryStore implements DeployStore {
         status: "provisioning",
         authDirPath: authDir,
         containerId: null,
+        gatewayToken: extra?.gatewayToken ?? existing.gatewayToken,
+        containerName: extra?.containerName ?? existing.containerName,
         createdAt: now,
       };
       this.gateways.set(existing.id, updated);
@@ -153,8 +156,10 @@ export class MemoryStore implements DeployStore {
       id: `gw_${randomUUID()}`,
       userId,
       containerId: null,
+      containerName: extra?.containerName ?? "",
       status: "provisioning",
       authDirPath: authDir,
+      gatewayToken: extra?.gatewayToken ?? "",
       createdAt: now,
     };
     this.gateways.set(instance.id, instance);

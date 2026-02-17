@@ -60,7 +60,9 @@ export type GatewayInstanceRecord = {
   id: string;
   userId: string;
   containerId: string | null;
+  containerName: string;
   status: "provisioning" | "running" | "stopped" | "error";
   authDirPath: string;
+  gatewayToken: string;
   createdAt: Date;
 };

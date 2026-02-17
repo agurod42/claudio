@@ -72,8 +72,10 @@ const mapGateway = (row: QueryResultRow): GatewayInstanceRecord => ({
   id: String(row.id),
   userId: String(row.user_id),
   containerId: row.container_id ? String(row.container_id) : null,
+  containerName: row.container_name ? String(row.container_name) : "",
   status: row.status,
   authDirPath: String(row.auth_dir_path),
+  gatewayToken: row.gateway_token ? String(row.gateway_token) : "",
   createdAt: parseDate(row.created_at),
 });
 
@@ -136,6 +138,10 @@ export class PostgresStore implements DeployStore {
     if (update.userId !== undefined) {
       fields.push(`user_id = $${idx++}`);
       values.push(update.userId);
+    }
+    if (update.authDir !== undefined) {
+      fields.push(`auth_dir = $${idx++}`);
+      values.push(update.authDir);
     }
     if (fields.length === 0) {
       return this.getLoginSession(id);
@@ -263,20 +269,23 @@ export class PostgresStore implements DeployStore {
   async createGatewayInstanceForUser(
     userId: string,
     authDir: string,
+    extra?: { gatewayToken?: string; containerName?: string },
   ): Promise<GatewayInstanceRecord> {
     const id = `gw_${randomUUID()}`;
     const result = await this.pool.query(
       `insert into gateway_instances
-      (id, user_id, container_id, status, auth_dir_path)
-      values ($1,$2,$3,$4,$5)
+      (id, user_id, container_id, status, auth_dir_path, gateway_token, container_name)
+      values ($1,$2,$3,$4,$5,$6,$7)
       on conflict (user_id)
       do update set
         status = excluded.status,
         auth_dir_path = excluded.auth_dir_path,
+        gateway_token = coalesce(excluded.gateway_token, gateway_instances.gateway_token),
+        container_name = coalesce(excluded.container_name, gateway_instances.container_name),
         container_id = null,
         created_at = now()
       returning *`,
-      [id, userId, null, "provisioning", authDir],
+      [id, userId, null, "provisioning", authDir, extra?.gatewayToken ?? null, extra?.containerName ?? null],
     );
     return mapGateway(result.rows[0]);
   }

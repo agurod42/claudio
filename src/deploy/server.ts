@@ -1,5 +1,4 @@
 import express from "express";
-import Docker from "dockerode";
 import { STATUS_CODES, type IncomingMessage, request as httpRequest } from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -10,6 +9,7 @@ import { initDatabase } from "./db.js";
 import { runLoginWorker } from "./login-worker.js";
 import { NoopProvisioner } from "./provisioner.js";
 import { DockerProvisioner } from "./provisioner-docker.js";
+import type { Provisioner } from "./provisioner.js";
 import { SessionEvents } from "./session-events.js";
 import {
   createLoginSessionRecord,
@@ -184,7 +184,6 @@ const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
 };
 
 const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
-  // Keep context conservative to stay under Groq per-request TPM limits.
   best: 16_000,
   fast: 16_000,
   premium: 16_000,
@@ -281,23 +280,6 @@ const ensureGatewayControlUiConfig = async (
     return { token: tokenValue, changed };
   } catch {
     return { token: null, changed: false };
-  }
-};
-
-const readGatewayTokenFromConfig = async (authDirPath: string): Promise<string | null> => {
-  try {
-    const configPath = path.join(authDirPath, "openclaw.json");
-    const raw = await fs.readFile(configPath, "utf-8");
-    const parsed = JSON.parse(raw) as {
-      gateway?: { auth?: { token?: unknown } };
-    };
-    const token = parsed?.gateway?.auth?.token;
-    if (typeof token === "string" && token.trim().length > 0) {
-      return token.trim();
-    }
-    return null;
-  } catch {
-    return null;
   }
 };
 
@@ -433,18 +415,25 @@ const start = async () => {
   const pool = await initDatabase();
   const store = createStore(pool);
   const events = new SessionEvents();
-  const provisioner =
+  const provisioner: Provisioner =
     deployConfig.provisioner === "docker"
       ? new DockerProvisioner(store)
       : new NoopProvisioner(store);
-  const stopReaper =
-    provisioner instanceof DockerProvisioner
-      ? provisioner.startReaper(deployConfig.reaperIntervalMs, deployConfig.reaperMaxAgeMs)
-      : null;
+  const isDocker = provisioner instanceof DockerProvisioner;
+
+  // Startup reconciliation: sync DB with actual Docker state
+  if (isDocker) {
+    try {
+      await provisioner.reconcile();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("Reconciliation failed:", err);
+    }
+  }
+
   const activeSessions = new Map<string, Promise<void>>();
   const sessionUsers = new Map<string, string>();
   const baseUrl = resolveBaseUrl(deployConfig.port);
-  const adminDocker = provisioner instanceof DockerProvisioner ? new Docker() : null;
   const adminToken = deployConfig.adminToken.trim();
 
   const requireAdmin: express.RequestHandler = (req, res, next) => {
@@ -465,33 +454,10 @@ const start = async () => {
   };
 
   const inspectGatewayRuntime = async (containerId: string) => {
-    if (!adminDocker) {
+    if (!isDocker) {
       return null;
     }
-    try {
-      const info = await adminDocker.getContainer(containerId).inspect();
-      const networkData = Object.values(info.NetworkSettings?.Networks ?? {});
-      const ip = networkData.find((entry) => entry?.IPAddress)?.IPAddress ?? null;
-      return {
-        running: Boolean(info.State?.Running),
-        status: info.State?.Status ?? "unknown",
-        ip,
-      };
-    } catch {
-      return null;
-    }
-  };
-
-  const restartGatewayContainer = async (containerId: string) => {
-    if (!adminDocker) {
-      return false;
-    }
-    try {
-      await adminDocker.getContainer(containerId).restart();
-      return true;
-    } catch {
-      return false;
-    }
+    return (provisioner as DockerProvisioner).inspectRuntime(containerId);
   };
 
   const waitForGatewayRuntime = async (containerId: string, timeoutMs = 15_000) => {
@@ -530,14 +496,41 @@ const start = async () => {
         events.emit(sessionId, {
           type: "status",
           state: "deploying",
-          message: "Deploying your agent.",
+          message: "Provisioning your gateway...",
         });
+
         const existingAgent = await store.getAgentByUserId(linked.userId);
         const agentSettings =
           existingAgent ?? (await store.createAgentForUser(linked.userId, defaultAgentSettings()));
-        await provisioner.provision(linked.userId, authDir, linked.whatsappId, {
-          modelTier: agentSettings.modelTier,
-        });
+
+        // Move WA session data to the user's permanent directory
+        const userAuthDir = path.join(deployConfig.authRoot, linked.userId);
+        const permanentWaDir = path.join(userAuthDir, "wa-session-data");
+        await fs.mkdir(permanentWaDir, { recursive: true });
+        // Copy session auth files from the temp session dir to the user's dir
+        const tempWaDir = authDir;
+        try {
+          const files = await fs.readdir(tempWaDir);
+          for (const file of files) {
+            const src = path.join(tempWaDir, file);
+            const dest = path.join(permanentWaDir, file);
+            await fs.copyFile(src, dest);
+          }
+        } catch {
+          // temp dir might not have any files yet
+        }
+
+        const result = await provisioner.provision(
+          linked.userId,
+          userAuthDir,
+          linked.whatsappId,
+          { modelTier: agentSettings.modelTier },
+        );
+
+        if (!result.healthy) {
+          throw new Error("Gateway container failed to start.");
+        }
+
         await store.updateLoginSession(sessionId, { state: "ready" });
         events.emit(sessionId, {
           type: "status",
@@ -632,6 +625,7 @@ const start = async () => {
       latestGatewayByUserId.set(gateway.userId, gateway);
     }
 
+    // Inspect live status from Docker for each gateway
     const runtimeByContainerId = new Map<
       string,
       Awaited<ReturnType<typeof inspectGatewayRuntime>>
@@ -646,12 +640,6 @@ const start = async () => {
     await Promise.all(
       containerIds.map(async (containerId) => {
         runtimeByContainerId.set(containerId, await inspectGatewayRuntime(containerId));
-      }),
-    );
-    const gatewayTokenByGatewayId = new Map<string, string | null>();
-    await Promise.all(
-      sortedGateways.map(async (gateway) => {
-        gatewayTokenByGatewayId.set(gateway.id, await readGatewayTokenFromConfig(gateway.authDirPath));
       }),
     );
 
@@ -690,7 +678,7 @@ const start = async () => {
               runtimeStatus: runtime?.status ?? null,
               runtimeRunning: runtime?.running ?? null,
               runtimeIp: runtime?.ip ?? null,
-              gatewayToken: gatewayTokenByGatewayId.get(gateway.id) ?? null,
+              gatewayToken: gateway.gatewayToken || null,
               proxyBasePath,
               canvasPath: proxyBasePath ? `${proxyBasePath}__openclaw__/canvas/` : null,
             }
@@ -735,7 +723,7 @@ const start = async () => {
         runtimeStatus: runtime?.status ?? null,
         runtimeRunning: runtime?.running ?? null,
         runtimeIp: runtime?.ip ?? null,
-        gatewayToken: gatewayTokenByGatewayId.get(gateway.id) ?? null,
+        gatewayToken: gateway.gatewayToken || null,
         proxyBasePath,
         canvasPath: `${proxyBasePath}__openclaw__/canvas/`,
       };
@@ -775,21 +763,12 @@ const start = async () => {
 
     try {
       const sessionsClosed = await closeUserSessions(userId);
-      const gateway = await store.getGatewayInstanceByUserId(userId);
-      const deprovisionedGateway = gateway ? await provisioner.deprovision(gateway) : null;
+      await provisioner.deprovision(userId);
 
       res.json({
         ok: true,
         userId,
         sessionsClosed,
-        gateway: gateway
-          ? {
-              id: gateway.id,
-              hadContainer: Boolean(gateway.containerId),
-              status: deprovisionedGateway?.status ?? gateway.status,
-              containerId: deprovisionedGateway?.containerId ?? gateway.containerId,
-            }
-          : null,
       });
     } catch {
       res.status(500).json({ error: "deprovision_failed" });
@@ -802,7 +781,7 @@ const start = async () => {
       return;
     }
 
-    if (!adminDocker) {
+    if (!isDocker) {
       res.status(400).json({ error: "docker_provisioner_required" });
       return;
     }
@@ -829,7 +808,7 @@ const start = async () => {
         hostOrigin,
       ]);
       if (configState.changed) {
-        await restartGatewayContainer(gateway.containerId);
+        await provisioner.restartContainer(userId);
       }
       const runtime = configState.changed
         ? await waitForGatewayRuntime(gateway.containerId)
@@ -875,7 +854,7 @@ const start = async () => {
     const expiresAt = new Date(Date.now() + deployConfig.sessionTtlMs);
     const session = createLoginSessionRecord({ authDir: "", expiresAt });
     const sessionId = session.id;
-    const authDir = path.join(deployConfig.authRoot, sessionId);
+    const authDir = path.join(deployConfig.authRoot, "tmp", sessionId);
     await fs.mkdir(authDir, { recursive: true });
     session.authDir = authDir;
     await store.createLoginSession(session);
@@ -990,20 +969,20 @@ const start = async () => {
       res.status(404).json({ error: "not_found" });
       return;
     }
+
+    // Live status from Docker (updates DB as side effect)
+    const gatewayStatus = await provisioner.inspectStatus(userId);
+
+    // Ensure model config is up to date
     const gateway = await store.getGatewayInstanceByUserId(userId);
-    let gatewayStatus = gateway?.status ?? null;
     if (gateway) {
       const modelConfig = await ensureGatewayAgentModelConfig(gateway.authDirPath, agent.modelTier);
-      if (modelConfig.changed && gateway.containerId) {
-        await restartGatewayContainer(gateway.containerId);
-        await waitForGatewayRuntime(gateway.containerId);
-      }
-      if (provisioner instanceof DockerProvisioner) {
-        const refreshed = await provisioner.refreshInstance(gateway);
-        gatewayStatus = refreshed?.status ?? gatewayStatus;
+      if (modelConfig.changed) {
+        await provisioner.restartContainer(userId);
       }
     }
-    const gatewayToken = gateway ? await readGatewayTokenFromConfig(gateway.authDirPath) : null;
+
+    const gatewayToken = gateway?.gatewayToken || null;
     res.json({
       agentId: agent.id,
       status: "running",
@@ -1042,12 +1021,8 @@ const start = async () => {
     const gateway = await store.getGatewayInstanceByUserId(userId);
     if (gateway) {
       const modelConfig = await ensureGatewayAgentModelConfig(gateway.authDirPath, next.modelTier);
-      if (modelConfig.changed && gateway.containerId) {
-        await restartGatewayContainer(gateway.containerId);
-        await waitForGatewayRuntime(gateway.containerId);
-        if (provisioner instanceof DockerProvisioner) {
-          await provisioner.refreshInstance(gateway);
-        }
+      if (modelConfig.changed) {
+        await provisioner.restartContainer(userId);
       }
     }
     res.json({
@@ -1085,7 +1060,7 @@ const start = async () => {
           return;
         }
       }
-      if (!adminDocker) {
+      if (!isDocker) {
         writeUpgradeJsonError(socket, 400, { error: "docker_provisioner_required" });
         return;
       }
@@ -1108,7 +1083,7 @@ const start = async () => {
         hostOrigin,
       ]);
       if (configState.changed) {
-        await restartGatewayContainer(gateway.containerId);
+        await provisioner.restartContainer(parsed.userId);
       }
       const runtime = configState.changed
         ? await waitForGatewayRuntime(gateway.containerId)
@@ -1244,9 +1219,6 @@ const start = async () => {
   });
 
   const shutdown = () => {
-    if (stopReaper) {
-      stopReaper();
-    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
