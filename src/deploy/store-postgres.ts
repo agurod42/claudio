@@ -312,4 +312,12 @@ export class PostgresStore implements DeployStore {
     }
     return mapGateway(result.rows[0]);
   }
+
+  async deleteExpiredLoginSessions(before: Date): Promise<number> {
+    const result = await this.pool.query(
+      "delete from login_sessions where expires_at < $1",
+      [before],
+    );
+    return result.rowCount ?? 0;
+  }
 }

@@ -3,6 +3,7 @@ const screens = {
   pairing: document.getElementById("screen-pairing"),
   deploying: document.getElementById("screen-deploying"),
   success: document.getElementById("screen-success"),
+  dashboard: document.getElementById("screen-dashboard"),
   customize: document.getElementById("screen-customize"),
   faq: document.getElementById("screen-faq"),
 };
@@ -249,7 +250,7 @@ const loadUserAndAgent = async ({ redirectIfGatewayRunning = false } = {}) => {
 };
 
 const maybeResumeAndRedirect = async () => {
-  if (!authToken || redirectedToGateway || redirectInFlight) {
+  if (!authToken || redirectInFlight) {
     return;
   }
   try {
@@ -280,7 +281,11 @@ const maybeResumeAndRedirect = async () => {
     if (!gatewayPath) {
       return;
     }
-    redirectToGateway(gatewayPath);
+    const openGatewayBtn = document.getElementById("cta-open-gateway");
+    if (openGatewayBtn) {
+      openGatewayBtn.href = gatewayPath;
+    }
+    showScreen("dashboard");
   } catch {
     // ignore
   } finally {
@@ -351,6 +356,10 @@ const setupActions = () => {
   const ctaSkip = document.getElementById("cta-skip");
   if (ctaSkip) {
     ctaSkip.addEventListener("click", () => showScreen("success"));
+  }
+  const ctaRelink = document.getElementById("cta-relink");
+  if (ctaRelink) {
+    ctaRelink.addEventListener("click", startSession);
   }
   if (customizeForm) {
     customizeForm.addEventListener("submit", handleCustomizeSubmit);

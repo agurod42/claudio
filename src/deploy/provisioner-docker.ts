@@ -223,9 +223,9 @@ export class DockerProvisioner implements Provisioner {
       ...resolveGatewayProviderEnv(),
     ];
 
-    const binds = this.resolveBinds();
+    const mounts = this.resolveMounts(userId);
     const hostConfig: Docker.ContainerCreateOptions["HostConfig"] = {
-      Binds: binds,
+      Mounts: mounts,
       RestartPolicy: { Name: "unless-stopped" },
     };
     if (this.opts.network) {
@@ -395,25 +395,33 @@ export class DockerProvisioner implements Provisioner {
     return `${this.opts.containerPrefix}${userId}`;
   }
 
-  private resolveGatewayAuthDir(userId: string) {
-    if (this.opts.authVolume) {
-      return path.posix.join("/data/auth", userId);
-    }
+  private resolveGatewayAuthDir(_userId: string) {
+    // With per-user subpath mount, the user's dir is mounted directly at /data/auth
     return "/data/auth";
   }
 
-  private resolveGatewayConfigPath(userId: string) {
-    if (this.opts.authVolume) {
-      return path.posix.join("/data/auth", userId, CONFIG_FILENAME);
-    }
+  private resolveGatewayConfigPath(_userId: string) {
     return path.posix.join("/data/auth", CONFIG_FILENAME);
   }
 
-  private resolveBinds() {
+  private resolveMounts(userId: string): Docker.MountConfig {
     if (this.opts.authVolume) {
-      return [`${this.opts.authVolume}:/data/auth`];
+      return [
+        {
+          Type: "volume",
+          Source: this.opts.authVolume,
+          Target: "/data/auth",
+          VolumeOptions: { Subpath: userId },
+        } as Docker.MountSettings,
+      ];
     }
-    return [`${deployConfig.authRoot}:/data/auth`];
+    return [
+      {
+        Type: "bind",
+        Source: path.join(deployConfig.authRoot, userId),
+        Target: "/data/auth",
+      },
+    ];
   }
 
   private async writeConfigFile(

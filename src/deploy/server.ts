@@ -431,6 +431,32 @@ const start = async () => {
     }
   }
 
+  // Periodic cleanup: purge expired sessions + stale temp dirs
+  const runReaper = async () => {
+    try {
+      const deleted = await store.deleteExpiredLoginSessions(new Date());
+      if (deleted > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`Reaper: purged ${deleted} expired login sessions.`);
+      }
+      const tmpDir = path.join(deployConfig.authRoot, "tmp");
+      const entries = await fs.readdir(tmpDir).catch(() => [] as string[]);
+      const now = Date.now();
+      for (const entry of entries) {
+        const entryPath = path.join(tmpDir, entry);
+        const stat = await fs.stat(entryPath).catch(() => null);
+        if (stat && now - stat.mtimeMs > deployConfig.reaperMaxAgeMs) {
+          await fs.rm(entryPath, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("Reaper error:", err);
+    }
+  };
+  void runReaper();
+  const reaperInterval = setInterval(() => void runReaper(), deployConfig.reaperIntervalMs);
+
   const activeSessions = new Map<string, Promise<void>>();
   const sessionUsers = new Map<string, string>();
   const baseUrl = resolveBaseUrl(deployConfig.port);
@@ -1219,6 +1245,7 @@ const start = async () => {
   });
 
   const shutdown = () => {
+    clearInterval(reaperInterval);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

@@ -45,6 +45,7 @@ export interface DeployStore {
     status: GatewayInstanceRecord["status"],
     containerId?: string | null,
   ): Promise<GatewayInstanceRecord | null>;
+  deleteExpiredLoginSessions(before: Date): Promise<number>;
 }
 
 export const createStore = (pool: Pool | null): DeployStore => {

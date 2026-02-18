@@ -166,6 +166,17 @@ export class MemoryStore implements DeployStore {
     return instance;
   }
 
+  async deleteExpiredLoginSessions(before: Date): Promise<number> {
+    let count = 0;
+    for (const [id, session] of this.sessions) {
+      if (session.expiresAt < before) {
+        this.sessions.delete(id);
+        count++;
+      }
+    }
+    return count;
+  }
+
   async updateGatewayInstanceStatus(
     id: string,
     status: GatewayInstanceRecord["status"],

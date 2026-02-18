@@ -49,7 +49,8 @@ services:
 
   gateway-image:
     build:
-      context: ./openclaw
+      context: .
+      dockerfile: Dockerfile.gateway
     image: openclaw-gateway:local
     command:
       [

@@ -1,0 +1,390 @@
+diff --git a/src/cli/program/command-registry.ts b/src/cli/program/command-registry.ts
+index 7d7de6bfb..411405f98 100644
+--- a/src/cli/program/command-registry.ts
++++ b/src/cli/program/command-registry.ts
+@@ -17,6 +17,7 @@ import { registerOnboardCommand } from "./register.onboard.js";
+ import { registerSetupCommand } from "./register.setup.js";
+ import { registerStatusHealthSessionsCommands } from "./register.status-health-sessions.js";
+ import { registerSubCliCommands } from "./register.subclis.js";
++import { registerToolsCli } from "../tools-cli.js";
+ 
+ type CommandRegisterParams = {
+   program: Command;
+@@ -161,6 +162,10 @@ export const commandRegistry: CommandRegistration[] = [
+     id: "browser",
+     register: ({ program }) => registerBrowserCli(program),
+   },
++  {
++    id: "tools",
++    register: ({ program }) => registerToolsCli(program),
++  },
+ ];
+ 
+ export function registerProgramCommands(
+diff --git a/src/cli/theme.ts b/src/cli/theme.ts
+new file mode 100644
+index 000000000..e9a3aa0f4
+--- /dev/null
++++ b/src/cli/theme.ts
+@@ -0,0 +1,13 @@
++import chalk from "chalk";
++
++export const theme = {
++  bold: (s: string) => chalk.bold(s),
++  success: (s: string) => chalk.green(s),
++  error: (s: string) => chalk.red(s),
++  warning: (s: string) => chalk.yellow(s),
++  info: (s: string) => chalk.blue(s),
++  muted: (s: string) => chalk.gray(s),
++  link: (s: string) => chalk.underline.cyan(s),
++  code: (s: string) => chalk.inverse(s),
++  heading: (s: string) => chalk.bold.underline(s),
++};
+diff --git a/src/cli/tools-cli.test.ts b/src/cli/tools-cli.test.ts
+new file mode 100644
+index 000000000..b098a1ad4
+--- /dev/null
++++ b/src/cli/tools-cli.test.ts
+@@ -0,0 +1,129 @@
++import { Command } from "commander";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++const loadConfig = vi.fn(() => ({}));
++const writeConfigFile = vi.fn();
++const createOpenClawCodingTools = vi.fn(() => [
++  { name: "read" },
++  { name: "write" },
++  { name: "exec" },
++]);
++const resolveEffectiveToolPolicy = vi.fn(() => ({
++  agentId: "default",
++  globalPolicy: { allow: ["*"], deny: [] },
++}));
++const isToolAllowedByPolicies = vi.fn(() => true);
++const resolveGroupToolPolicy = vi.fn(() => ({}));
++const resolveSubagentToolPolicy = vi.fn(() => ({}));
++const resolveToolProfilePolicy = vi.fn(() => ({}));
++
++vi.mock("../../config/io.js", () => ({
++  loadConfig,
++  writeConfigFile,
++}));
++
++vi.mock("../../agents/pi-tools.js", () => ({
++  createOpenClawCodingTools,
++}));
++
++vi.mock("../../agents/pi-tools.policy.js", () => ({
++  resolveEffectiveToolPolicy,
++  isToolAllowedByPolicies,
++  resolveGroupToolPolicy,
++  resolveSubagentToolPolicy,
++}));
++
++vi.mock("../../agents/tool-policy.js", () => ({
++  resolveToolProfilePolicy,
++}));
++
++vi.mock("./theme.js", () => ({
++  theme: {
++    bold: (s: string) => s,
++    success: (s: string) => s,
++    error: (s: string) => s,
++  },
++}));
++
++afterEach(async () => {
++  vi.restoreAllMocks();
++});
++
++describe("tools cli", () => {
++  it("lists all available tools", async () => {
++    const { registerToolsCli } = await import("./tools-cli.js");
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++    const program = new Command();
++    program.name("test");
++    registerToolsCli(program);
++    await program.parseAsync(["tools", "list"], { from: "user" });
++
++    expect(log).toHaveBeenCalledWith("Available tools:");
++    expect(log).toHaveBeenCalledWith("- read");
++    expect(log).toHaveBeenCalledWith("- write");
++    expect(log).toHaveBeenCalledWith("- exec");
++  });
++
++  it("shows the status of a specific tool", async () => {
++    const { registerToolsCli } = await import("./tools-cli.js");
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++    const program = new Command();
++    program.name("test");
++    registerToolsCli(program);
++    await program.parseAsync(["tools", "status", "read"], { from: "user" });
++
++    expect(log).toHaveBeenCalledWith(expect.stringContaining("Tool: read - Enabled"));
++  });
++
++  it("enables a tool for a specific agent", async () => {
++    const { registerToolsCli } = await import("./tools-cli.js");
++    loadConfig.mockReturnValue({
++      agents: { list: [{ id: "test-agent", tools: { deny: ["read"] } }] },
++    });
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++    const program = new Command();
++    program.name("test");
++    registerToolsCli(program);
++    await program.parseAsync(["tools", "enable", "read", "--agent", "test-agent"], {
++      from: "user",
++    });
++
++    expect(writeConfigFile).toHaveBeenCalledWith({
++      agents: {
++        list: [
++          {
++            id: "test-agent",
++            tools: { alsoAllow: ["read"], deny: [] },
++          },
++        ],
++      },
++    });
++    expect(log).toHaveBeenCalledWith("Tool read enabled for agent test-agent.");
++  });
++
++  it("disables a tool for a specific agent", async () => {
++    const { registerToolsCli } = await import("./tools-cli.js");
++    loadConfig.mockReturnValue({
++      agents: { list: [{ id: "test-agent", tools: { allow: ["read"] } }] },
++    });
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++    const program = new Command();
++    program.name("test");
++    registerToolsCli(program);
++    await program.parseAsync(["tools", "disable", "read", "--agent", "test-agent"], {
++      from: "user",
++    });
++
++    expect(writeConfigFile).toHaveBeenCalledWith({
++      agents: {
++        list: [
++          {
++            id: "test-agent",
++            tools: { allow: [], deny: ["read"] },
++          },
++        ],
++      },
++    });
++    expect(log).toHaveBeenCalledWith("Tool read disabled for agent test-agent.");
++  });
++});
+diff --git a/src/cli/tools-cli.ts b/src/cli/tools-cli.ts
+new file mode 100644
+index 000000000..440d1eb27
+--- /dev/null
++++ b/src/cli/tools-cli.ts
+@@ -0,0 +1,207 @@
++import { Command } from "commander";
++import { loadConfig, writeConfigFile } from "../config/io.js";
++import { createOpenClawCodingTools } from "../agents/pi-tools.js";
++import {
++  resolveEffectiveToolPolicy,
++  isToolAllowedByPolicies,
++  resolveGroupToolPolicy,
++  resolveSubagentToolPolicy,
++} from "../agents/pi-tools.policy.js";
++import { resolveToolProfilePolicy } from "../agents/tool-policy.js";
++import { theme } from "./theme.js";
++
++export function registerToolsCli(program: Command) {
++  const toolsCommand = program
++    .command("tools")
++    .description("Manage tools and their policies.");
++
++  toolsCommand
++    .command("status [tool-name]")
++    .description("Show the status of a specific tool or all tools.")
++    .option("-a, --agent <agent-id>", "The agent to check the status for.")
++    .action(async (toolName, options) => {
++      const config = loadConfig();
++      const allTools = createOpenClawCodingTools({ config });
++      const tools = toolName
++        ? allTools.filter((t) => t.name === toolName)
++        : allTools;
++
++      if (tools.length === 0) {
++        console.log(`Tool "${toolName}" not found.`);
++        return;
++      }
++
++      const sessionKey = options.agent ? `agent:${options.agent}` : "main";
++
++      for (const tool of tools) {
++        const {
++          agentId,
++          globalPolicy,
++          globalProviderPolicy,
++          agentPolicy,
++          agentProviderPolicy,
++          profile,
++          providerProfile,
++        } = resolveEffectiveToolPolicy({
++          config,
++          sessionKey,
++        });
++
++        const subagentPolicy = resolveSubagentToolPolicy(config);
++        const groupPolicy = resolveGroupToolPolicy({ config, sessionKey });
++        const profilePolicy = resolveToolProfilePolicy(profile);
++        const providerProfilePolicy = resolveToolProfilePolicy(providerProfile);
++
++        const policies = [
++          profilePolicy,
++          providerProfilePolicy,
++          globalPolicy,
++          globalProviderPolicy,
++          agentPolicy,
++          agentProviderPolicy,
++          groupPolicy,
++          subagentPolicy,
++        ];
++
++        const isAllowed = isToolAllowedByPolicies(tool.name, policies);
++
++        console.log(
++          `
++Tool: ${theme.bold(tool.name)} - ${
++            isAllowed
++              ? theme.success("Enabled")
++              : theme.error("Disabled")
++          }`
++        );
++
++        console.log(`Agent: ${agentId ?? "default"}`);
++
++        const logPolicy = (name: string, policy: any) => {
++          if (policy) {
++            console.log(
++              `  ${name}: allow: ${JSON.stringify(
++                policy.allow
++              )}, deny: ${JSON.stringify(policy.deny)}`
++            );
++          }
++        };
++
++        logPolicy("  Profile", profilePolicy);
++        logPolicy("  Provider Profile", providerProfilePolicy);
++        logPolicy("  Global", globalPolicy);
++        logPolicy("  Global Provider", globalProviderPolicy);
++        logPolicy("  Agent", agentPolicy);
++        logPolicy("  Agent Provider", agentProviderPolicy);
++        logPolicy("  Group", groupPolicy);
++        logPolicy("  Subagent", subagentPolicy);
++      }
++    });
++
++    toolsCommand
++    .command("enable <tool-name>")
++    .description("Enable a tool for a specific agent.")
++    .option("-a, --agent <agent-id>", "The agent to enable the tool for.", "default")
++    .action(async (toolName, options) => {
++      const config = loadConfig();
++      const agentId = options.agent;
++
++      if (!config.agents) {
++        config.agents = { list: [] };
++      }
++      if (!config.agents.list) {
++        config.agents.list = [];
++      }
++
++      let agent = config.agents.list.find((a) => a.id === agentId);
++      if (!agent) {
++        agent = { id: agentId };
++        config.agents.list.push(agent);
++      }
++
++      if (!agent.tools || typeof agent.tools !== "object") {
++        agent.tools = {};
++      }
++
++      // Add to alsoAllow
++      if (!agent.tools.alsoAllow) {
++        agent.tools.alsoAllow = [];
++      }
++      if (!agent.tools.alsoAllow.includes(toolName)) {
++        agent.tools.alsoAllow.push(toolName);
++      }
++
++      // Remove from deny
++      if (agent.tools.deny) {
++        agent.tools.deny = agent.tools.deny.filter((t) => t !== toolName);
++      }
++
++      writeConfigFile(config);
++      console.log(
++        `Tool ${theme.bold(toolName)} enabled for agent ${theme.bold(agentId)}.`
++      );
++    });
++
++    toolsCommand
++    .command("disable <tool-name>")
++    .description("Disable a tool for a specific agent.")
++    .option("-a, --agent <agent-id>", "The agent to disable the tool for.", "default")
++    .action(async (toolName, options) => {
++      const config = loadConfig();
++      const agentId = options.agent;
++
++      if (!config.agents) {
++        config.agents = { list: [] };
++      }
++      if (!config.agents.list) {
++        config.agents.list = [];
++      }
++
++      let agent = config.agents.list.find((a) => a.id === agentId);
++      if (!agent) {
++        agent = { id: agentId };
++        config.agents.list.push(agent);
++      }
++
++      if (!agent.tools || typeof agent.tools !== "object") {
++        agent.tools = {};
++      }
++
++      // Add to deny
++      if (!agent.tools.deny) {
++        agent.tools.deny = [];
++      }
++      if (!agent.tools.deny.includes(toolName)) {
++        agent.tools.deny.push(toolName);
++      }
++
++      // Remove from alsoAllow
++      if (agent.tools.alsoAllow) {
++        agent.tools.alsoAllow = agent.tools.alsoAllow.filter(
++          (t) => t !== toolName
++        );
++      }
++      
++      // Remove from allow
++      if (agent.tools.allow) {
++        agent.tools.allow = agent.tools.allow.filter(
++          (t) => t !== toolName
++        );
++      }
++
++      writeConfigFile(config);
++      console.log(
++        `Tool ${theme.bold(toolName)} disabled for agent ${theme.bold(
++          agentId
++        )}.`
++      );
++    });
++
++  toolsCommand.command("list").description("List all available tools.").action(() => {
++    const config = loadConfig();
++    const allTools = createOpenClawCodingTools({ config });
++    console.log("Available tools:");
++    for (const tool of allTools) {
++      console.log(`- ${tool.name}`);
++    }
++  });
++}
