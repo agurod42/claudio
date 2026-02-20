@@ -219,6 +219,10 @@ const buildConfig = (
   },
   agents: {
     defaults: {
+      // Point the workspace at the auth dir so OpenClaw reads BOOTSTRAP.md from
+      // there automatically on every main-agent run (sub-agents are excluded by
+      // OpenClaw's SUBAGENT_BOOTSTRAP_ALLOWLIST — only AGENTS.md and TOOLS.md).
+      workspace: authDir,
       contextTokens: resolveContextTokens(modelTier),
       model: {
         primary: resolvePrimaryModel(modelTier),
@@ -254,28 +258,9 @@ const PROFILE_FILE = "/data/auth/memory/user-profile.md";
 export default function register(api) {
   console.log("[clawdly-profile] plugin registered for userId=" + CLAWDLY_USER_ID);
 
-  // Inject the user profile into the system prompt on every turn.
-  // Using systemPrompt (not prependContext) keeps the profile invisible in the
-  // chat UI — it is appended to OpenClaw's built-in system prompt and never
-  // shows up as part of the user's message turn.
-  api.on("before_agent_start", async (_event) => {
-    try {
-      const profileMd = await readFile(PROFILE_FILE, "utf-8");
-      if (profileMd && profileMd.trim().length > 0) {
-        console.log("[clawdly-profile] before_agent_start: injecting profile via systemPrompt (" + profileMd.length + " chars)");
-        return {
-          systemPrompt:
-            "---\\n### What you know about this person\\n" +
-            profileMd +
-            "\\n---",
-        };
-      } else {
-        console.log("[clawdly-profile] before_agent_start: profile file empty — no context injected");
-      }
-    } catch (err) {
-      console.log("[clawdly-profile] before_agent_start: profile not available yet (" + String(err?.code ?? err) + ")");
-    }
-  });
+  // Profile context is injected via BOOTSTRAP.md in the workspace directory
+  // (agents.defaults.workspace = /data/auth). OpenClaw reads it automatically
+  // on every main-agent run — no hook needed here.
 
   // Forward each inbound message to the deploy server for profile enrichment.
   // event shape: { from: string, content: string, timestamp?: number }

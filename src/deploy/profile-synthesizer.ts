@@ -379,13 +379,22 @@ export const synthesizeUserProfile = async (
 
   const profileMd = await callLlm(provider, userPrompt, `userId=${userId}`);
 
-  // Write to the memory directory so OpenClaw's memory system and the plugin can read it
+  // Write to the memory directory so the get_user_profile tool and admin panel can read it
   const memoryDir = path.join(authDir, "memory");
   await fs.mkdir(memoryDir, { recursive: true });
   const profilePath = path.join(memoryDir, "user-profile.md");
   await fs.writeFile(profilePath, profileMd, "utf-8");
   // eslint-disable-next-line no-console
   console.log(`[synthesizer] profile written to ${profilePath} (${profileMd.length} chars) for userId=${userId}`);
+
+  // Write BOOTSTRAP.md to the workspace root (agents.defaults.workspace = authDir).
+  // OpenClaw reads it automatically on every main-agent run and injects it into the
+  // "# Project Context" section of the system prompt — no plugin hook required.
+  const bootstrapPath = path.join(authDir, "BOOTSTRAP.md");
+  const bootstrapContent = `### What you know about this person\n\n${profileMd}`;
+  await fs.writeFile(bootstrapPath, bootstrapContent, "utf-8");
+  // eslint-disable-next-line no-console
+  console.log(`[synthesizer] BOOTSTRAP.md written to ${bootstrapPath} for userId=${userId}`);
 
   // Persist to DB as backup
   await store.upsertProfileMd(userId, profileMd);
@@ -420,4 +429,9 @@ export const appendAgentNoteToProfile = async (
 
   await fs.mkdir(path.join(authDir, "memory"), { recursive: true });
   await fs.writeFile(profilePath, next, "utf-8");
+
+  // Keep BOOTSTRAP.md in sync so the agent sees the updated profile on the next run.
+  const bootstrapPath = path.join(authDir, "BOOTSTRAP.md");
+  const bootstrapContent = `### What you know about this person\n\n${next}`;
+  await fs.writeFile(bootstrapPath, bootstrapContent, "utf-8");
 };
