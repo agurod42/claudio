@@ -19,6 +19,8 @@ import {
 } from "./store.js";
 import type { SessionEvent } from "./session-events.js";
 import { issueToken, verifyToken } from "./auth.js";
+import { appendAgentNoteToProfile, synthesizeUserProfile } from "./profile-synthesizer.js";
+import { collectWhatsAppSyncData } from "./wa-session.js";
 import type { ModelTier } from "./types.js";
 
 const toJson = (value: unknown) => JSON.stringify(value);
@@ -172,21 +174,21 @@ const resolveDefaultControlUiAllowedOrigins = () => {
 const DEFAULT_TOOLS_PROFILE = "minimal";
 
 const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
-  best: "groq/llama-3.3-70b-versatile",
-  fast: "groq/llama-3.1-8b-instant",
-  premium: "groq/llama-3.3-70b-versatile",
+  best: "nvidia/moonshotai/kimi-k2.5",
+  fast: "nvidia/nvidia/llama-3.1-nemotron-nano-8b-v1",
+  premium: "nvidia/moonshotai/kimi-k2.5",
 };
 
 const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
-  best: ["groq/llama-3.1-8b-instant"],
-  fast: ["groq/llama-3.3-70b-versatile"],
-  premium: ["groq/llama-3.1-8b-instant"],
+  best: ["groq/llama-3.3-70b-versatile"],
+  fast: ["groq/llama-3.1-8b-instant"],
+  premium: ["groq/llama-3.3-70b-versatile"],
 };
 
 const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
-  best: 16_000,
+  best: 128_000,
   fast: 16_000,
-  premium: 16_000,
+  premium: 128_000,
 };
 
 const resolvePrimaryModelForTier = (modelTier: ModelTier | undefined) =>
@@ -462,6 +464,62 @@ const start = async () => {
   const baseUrl = resolveBaseUrl(deployConfig.port);
   const adminToken = deployConfig.adminToken.trim();
 
+  // ---------------------------------------------------------------------------
+  // Profile enrichment debounce state
+  // Each running gateway POSTs message events here. We batch them and
+  // re-synthesize the user profile after PROFILE_BATCH_SIZE messages or
+  // PROFILE_DEBOUNCE_MS ms have elapsed, whichever comes first.
+  // ---------------------------------------------------------------------------
+  const PROFILE_BATCH_SIZE = 10;
+  const PROFILE_DEBOUNCE_MS = 30 * 60 * 1000; // 30 minutes
+  const profileEventCounters = new Map<string, number>();
+  const profileDebounceTimers = new Map<string, NodeJS.Timeout>();
+
+  const triggerProfileSynthesis = (userId: string, authDirPath: string, modelTier: ModelTier | undefined, caller = "batch-debounce") => {
+    const existing = profileDebounceTimers.get(userId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    profileEventCounters.delete(userId);
+    const timer = setTimeout(() => {
+      profileDebounceTimers.delete(userId);
+      void (async () => {
+        try {
+          const user = (await store.listUsers()).find((u) => u.id === userId);
+          if (!user) return;
+          await synthesizeUserProfile(userId, user.whatsappId, authDirPath, modelTier, store, caller);
+        } catch (err) {
+          console.warn(`Profile re-synthesis failed for ${userId}:`, err);
+        }
+      })();
+    }, 2_000); // short delay so agent_note and a burst of messages are coalesced
+    profileDebounceTimers.set(userId, timer);
+  };
+
+  const recordProfileEvent = (userId: string, authDirPath: string, modelTier: ModelTier | undefined) => {
+    const count = (profileEventCounters.get(userId) ?? 0) + 1;
+    profileEventCounters.set(userId, count);
+    if (count >= PROFILE_BATCH_SIZE) {
+      triggerProfileSynthesis(userId, authDirPath, modelTier);
+    } else if (!profileDebounceTimers.has(userId)) {
+      // Start the 30-minute outer timer on first message
+      const timer = setTimeout(() => {
+        profileDebounceTimers.delete(userId);
+        profileEventCounters.delete(userId);
+        void (async () => {
+          try {
+            const user = (await store.listUsers()).find((u) => u.id === userId);
+            if (!user) return;
+            await synthesizeUserProfile(userId, user.whatsappId, authDirPath, modelTier, store, "30min-timer");
+          } catch (err) {
+            console.warn(`Profile re-synthesis failed for ${userId}:`, err);
+          }
+        })();
+      }, PROFILE_DEBOUNCE_MS);
+      profileDebounceTimers.set(userId, timer);
+    }
+  };
+
   const requireAdmin: express.RequestHandler = (req, res, next) => {
     if (isAdminDisabled()) {
       res.status(404).json({ error: "not_found" });
@@ -512,6 +570,11 @@ const start = async () => {
           store,
           events,
           sessionTtlMs: deployConfig.sessionTtlMs,
+          onProfileDataReady: (userId) => {
+            // Raw profile data was just saved. We'll synthesize after we know authDir (post-provision).
+            // Mark that this user has fresh data so startSessionFlow can trigger synthesis.
+            profileEventCounters.set(userId, 0);
+          },
         });
         const linked = await store.getLoginSession(sessionId);
         if (!linked || linked.state !== "linked" || !linked.userId || !linked.whatsappId) {
@@ -546,6 +609,20 @@ const start = async () => {
           // temp dir might not have any files yet
         }
 
+        // Run synthesis and provisioning in parallel to cut login time by ~20s.
+        // The plugin handles a missing profile gracefully, so it's fine if
+        // synthesis finishes slightly after the gateway starts.
+        const synthesisPromise = synthesizeUserProfile(
+          linked.userId,
+          linked.whatsappId,
+          userAuthDir,
+          agentSettings.modelTier,
+          store,
+          "login-flow",
+        ).catch((err) => {
+          console.warn(`Initial profile synthesis failed for ${linked.userId}:`, err);
+        });
+
         const result = await provisioner.provision(
           linked.userId,
           userAuthDir,
@@ -553,11 +630,68 @@ const start = async () => {
           { modelTier: agentSettings.modelTier },
         );
 
+        // Let synthesis finish in the background — don't block the "ready" event.
+        void synthesisPromise;
+
         if (!result.healthy) {
           throw new Error("Gateway container failed to start.");
         }
 
         await store.updateLoginSession(sessionId, { state: "ready" });
+
+        // After a fresh QR registration, the phone uploads its chat history to WA
+        // servers in the background (takes 1–5 min). Once uploaded, WA delivers
+        // messaging-history.set to the running gateway. We schedule a deferred
+        // reprovision to capture that data and re-synthesize the profile.
+        const profileAtLogin = await store.getProfileData(linked.userId);
+        const contactsAtLogin = (() => {
+          try { return JSON.parse(profileAtLogin?.contactsJson ?? "[]"); } catch { return []; }
+        })();
+        if (!Array.isArray(contactsAtLogin) || contactsAtLogin.length === 0) {
+          const DEFERRED_MS = 3 * 60 * 1000;
+          // eslint-disable-next-line no-console
+          console.log(`[login-flow] no WA contacts captured — scheduling deferred sync in ${DEFERRED_MS / 1000}s for userId=${linked.userId}`);
+          setTimeout(() => {
+            void (async () => {
+              try {
+                const current = await store.getProfileData(linked.userId);
+                const currentContacts = (() => {
+                  try { return JSON.parse(current?.contactsJson ?? "[]"); } catch { return []; }
+                })();
+                if (Array.isArray(currentContacts) && currentContacts.length > 0) {
+                  // eslint-disable-next-line no-console
+                  console.log(`[login-flow] deferred sync skipped — contacts already present for userId=${linked.userId}`);
+                  return;
+                }
+                // eslint-disable-next-line no-console
+                console.log(`[login-flow] deferred sync starting for userId=${linked.userId}`);
+                await provisioner.deprovision(linked.userId);
+                const deferred = await collectWhatsAppSyncData(permanentWaDir, 60_000);
+                if (deferred.contacts.length > 0 || deferred.chats.length > 0) {
+                  await store.upsertRawProfileData(linked.userId, deferred);
+                  await synthesizeUserProfile(linked.userId, linked.whatsappId, userAuthDir, agentSettings.modelTier, store, "deferred-login-sync");
+                  // eslint-disable-next-line no-console
+                  console.log(`[login-flow] deferred sync complete — contacts=${deferred.contacts.length} chats=${deferred.chats.length} for userId=${linked.userId}`);
+                } else {
+                  // eslint-disable-next-line no-console
+                  console.warn(`[login-flow] deferred sync: still no WA data for userId=${linked.userId} — phone may not have finished uploading yet`);
+                }
+              } catch (err) {
+                // eslint-disable-next-line no-console
+                console.warn(`[login-flow] deferred sync failed for userId=${linked.userId}:`, err);
+              } finally {
+                // Always restart the gateway whether sync succeeded or not
+                try {
+                  await provisioner.provision(linked.userId, userAuthDir, linked.whatsappId, { modelTier: agentSettings.modelTier });
+                } catch (err) {
+                  // eslint-disable-next-line no-console
+                  console.warn(`[login-flow] deferred sync: failed to reprovision userId=${linked.userId}:`, err);
+                }
+              }
+            })();
+          }, DEFERRED_MS);
+        }
+
         events.emit(sessionId, {
           type: "status",
           state: "ready",
@@ -801,6 +935,228 @@ const start = async () => {
     }
   });
 
+  app.post("/v1/admin/users/:userId/reset-wa-session", requireAdmin, async (req, res) => {
+    const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+    if (!userId) {
+      res.status(400).json({ error: "invalid_user_id" });
+      return;
+    }
+
+    try {
+      const users = await store.listUsers();
+      const user = users.find((u) => u.id === userId);
+      if (!user) {
+        res.status(404).json({ error: "user_not_found" });
+        return;
+      }
+
+      const gateway = await store.getGatewayInstanceByUserId(userId);
+      const authDir = gateway?.authDirPath || path.join(deployConfig.authRoot, userId);
+      const waAuthDir = path.join(authDir, "wa-session-data");
+
+      // Stop the gateway and close all login sessions
+      const sessionsClosed = await closeUserSessions(userId);
+      await provisioner.deprovision(userId);
+
+      // Wipe the WA session credentials so the next login starts fresh,
+      // triggering a full Baileys sync (contacts, chats, messages).
+      try {
+        await fs.rm(waAuthDir, { recursive: true, force: true });
+        // eslint-disable-next-line no-console
+        console.log(`[reset-wa] wiped ${waAuthDir} for userId=${userId}`);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[reset-wa] could not wipe waAuthDir for userId=${userId}:`, err);
+      }
+
+      res.json({ ok: true, userId, sessionsClosed });
+    } catch {
+      res.status(500).json({ error: "reset_failed" });
+    }
+  });
+
+  app.get("/v1/admin/users/:userId/profile", requireAdmin, async (req, res) => {
+    const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+    if (!userId) {
+      res.status(400).json({ error: "invalid_user_id" });
+      return;
+    }
+    try {
+      const profileData = await store.getProfileData(userId);
+
+      // Parse raw WA data into lightweight summaries for the admin UI.
+      const parseNames = (json: string | null): string[] => {
+        if (!json) return [];
+        try {
+          const arr = JSON.parse(json);
+          if (!Array.isArray(arr)) return [];
+          return arr
+            .map((item: Record<string, unknown>) =>
+              String(item?.name ?? item?.notify ?? item?.verifiedName ?? "").trim(),
+            )
+            .filter(Boolean);
+        } catch { return []; }
+      };
+
+      const parseMessages = (json: string | null): Array<{ role: string; text: string }> => {
+        if (!json) return [];
+        try {
+          const arr = JSON.parse(json);
+          if (!Array.isArray(arr)) return [];
+          const out: Array<{ role: string; text: string }> = [];
+          for (const msg of arr) {
+            const m = msg as Record<string, unknown>;
+            const inner = m.message as Record<string, unknown> | undefined;
+            if (!inner) continue;
+            const text =
+              typeof inner.conversation === "string"
+                ? inner.conversation
+                : typeof (inner.extendedTextMessage as Record<string, unknown> | undefined)?.text === "string"
+                  ? String((inner.extendedTextMessage as Record<string, unknown>).text)
+                  : null;
+            if (!text?.trim()) continue;
+            const key = m.key as Record<string, unknown> | undefined;
+            const role = key?.fromMe === true ? "me" : "them";
+            out.push({ role, text: text.trim().slice(0, 300) });
+            if (out.length >= 100) break;
+          }
+          return out;
+        } catch { return []; }
+      };
+
+      const contacts = parseNames(profileData?.contactsJson ?? null);
+      const chats = parseNames(profileData?.chatsJson ?? null);
+      const messages = parseMessages(profileData?.messagesJson ?? null);
+
+      res.json({
+        userId,
+        profileMd: profileData?.profileMd ?? null,
+        displayName: profileData?.displayName ?? null,
+        updatedAt: profileData?.profileUpdatedAt ?? null,
+        rawData: profileData
+          ? {
+              capturedAt: profileData.rawUpdatedAt,
+              displayName: profileData.displayName,
+              contacts: { count: contacts.length, names: contacts },
+              chats: { count: chats.length, names: chats },
+              messages: { count: messages.length, items: messages },
+            }
+          : null,
+      });
+    } catch {
+      res.status(500).json({ error: "profile_fetch_failed" });
+    }
+  });
+
+  // Re-run profile synthesis using whatever WA data is already in the DB.
+  // Useful after a prompt update or when the initial synthesis was poor quality.
+  app.post("/v1/admin/users/:userId/resynthesize", requireAdmin, async (req, res) => {
+    const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+    if (!userId) {
+      res.status(400).json({ error: "invalid_user_id" });
+      return;
+    }
+    try {
+      const users = await store.listUsers();
+      const user = users.find((u) => u.id === userId);
+      if (!user) {
+        res.status(404).json({ error: "user_not_found" });
+        return;
+      }
+      const agent = await store.getAgentByUserId(userId);
+      const authDir = path.join(deployConfig.authRoot, userId);
+      await synthesizeUserProfile(userId, user.whatsappId ?? "", authDir, agent?.modelTier, store, "admin-resynthesize");
+      res.json({ ok: true });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[resynthesize] failed for userId=${userId}:`, err);
+      res.status(500).json({ error: "resynthesize_failed" });
+    }
+  });
+
+  app.post("/v1/admin/users/:userId/reprovision", requireAdmin, async (req, res) => {
+    const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+    if (!userId) {
+      res.status(400).json({ error: "invalid_user_id" });
+      return;
+    }
+
+    try {
+      // Look up user and their existing gateway/agent
+      const users = await store.listUsers();
+      const user = users.find((u) => u.id === userId);
+      if (!user) {
+        res.status(404).json({ error: "user_not_found" });
+        return;
+      }
+
+      const agent = await store.getAgentByUserId(userId);
+      const gateway = await store.getGatewayInstanceByUserId(userId);
+      const authDir = gateway?.authDirPath || path.join(deployConfig.authRoot, userId);
+      const waAuthDir = path.join(authDir, "wa-session-data");
+
+      // Step 1: Stop the running gateway so we can briefly reconnect to WhatsApp
+      // and collect fresh sync data (contacts, chats, messages). This avoids a
+      // dual-connection conflict that would kick out the running container.
+      // eslint-disable-next-line no-console
+      console.log(`[reprovision] deprovisioning userId=${userId} before WhatsApp sync`);
+      await provisioner.deprovision(userId);
+
+      // Step 2: Collect WhatsApp sync data — only if valid credentials exist.
+      // Skip entirely when wa-session-data is absent or was wiped (e.g. after
+      // reset-wa-session). Without this guard Baileys would silently register
+      // a new device without a QR scan, defeating the purpose of the reset.
+      const credsPath = path.join(waAuthDir, "creds.json");
+      const hasCredentials = await fs.access(credsPath).then(() => true).catch(() => false);
+      if (hasCredentials) {
+        try {
+          // eslint-disable-next-line no-console
+          console.log(`[reprovision] collecting WhatsApp sync data for userId=${userId}`);
+          const syncData = await collectWhatsAppSyncData(waAuthDir, 60_000);
+          if (syncData.contacts.length > 0 || syncData.chats.length > 0 || syncData.messages.length > 0 || syncData.displayName) {
+            await store.upsertRawProfileData(userId, syncData);
+            // eslint-disable-next-line no-console
+            console.log(`[reprovision] stored sync data for userId=${userId}`);
+          } else {
+            // eslint-disable-next-line no-console
+            console.warn(`[reprovision] WhatsApp sync returned no data for userId=${userId}`);
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[reprovision] WhatsApp sync failed for userId=${userId}:`, err);
+        }
+      } else {
+        // eslint-disable-next-line no-console
+        console.log(`[reprovision] no WA credentials found — skipping sync for userId=${userId} (reset pending)`);
+      }
+
+      // Step 3: Synthesize profile from collected WhatsApp data.
+      try {
+        await synthesizeUserProfile(userId, user.whatsappId, authDir, agent?.modelTier, store, "reprovision");
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[reprovision] profile synthesis failed for userId=${userId}:`, err);
+      }
+
+      // Step 4: Provision new gateway container.
+      const result = await provisioner.provision(userId, authDir, user.whatsappId, {
+        modelTier: agent?.modelTier,
+      });
+
+      res.json({
+        ok: true,
+        userId,
+        healthy: result.healthy,
+        gatewayId: result.instance.id,
+        containerId: result.instance.containerId,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`Reprovision failed for ${userId}:`, err);
+      res.status(500).json({ error: "reprovision_failed" });
+    }
+  });
+
   app.use("/admin/openclaw/:userId", requireAdmin, async (req, res) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       res.status(405).json({ error: "method_not_allowed" });
@@ -874,6 +1230,52 @@ const start = async () => {
     } catch {
       res.status(502).json({ error: "upstream_unreachable" });
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Internal profile events — called by the OpenClaw plugin running inside
+  // each user's gateway container. Authenticated via the per-user gateway token.
+  // ---------------------------------------------------------------------------
+  app.post("/v1/internal/profile-events/:userId", async (req, res) => {
+    const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
+    if (!userId) {
+      res.status(400).json({ error: "invalid_user_id" });
+      return;
+    }
+
+    // Validate using the gateway token stored in the DB
+    const authHeader = req.header("authorization");
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+    if (!bearerToken) {
+      res.status(401).json({ error: "missing_token" });
+      return;
+    }
+    const gateway = await store.getGatewayInstanceByUserId(userId);
+    if (!gateway || !gateway.gatewayToken || gateway.gatewayToken !== bearerToken) {
+      res.status(401).json({ error: "invalid_token" });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const eventType = typeof body.type === "string" ? body.type : "message";
+    const content = typeof body.content === "string" ? body.content : "";
+
+    if (eventType === "agent_note" && content.trim()) {
+      // Immediately append the agent's note to the profile file, then queue synthesis
+      try {
+        await appendAgentNoteToProfile(gateway.authDirPath, content);
+      } catch (err) {
+        console.warn(`Failed to append agent note for ${userId}:`, err);
+      }
+      const agent = await store.getAgentByUserId(userId);
+      triggerProfileSynthesis(userId, gateway.authDirPath, agent?.modelTier, "agent-note");
+    } else if (eventType === "message") {
+      // Accumulate messages and trigger batched re-synthesis
+      const agent = await store.getAgentByUserId(userId);
+      recordProfileEvent(userId, gateway.authDirPath, agent?.modelTier);
+    }
+
+    res.json({ ok: true });
   });
 
   app.post("/v1/login-sessions", async (_req, res) => {

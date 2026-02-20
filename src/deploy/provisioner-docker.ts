@@ -8,6 +8,8 @@ import type { GatewayInstanceRecord, ModelTier } from "./types.js";
 import type { ProvisionOptions, ProvisionResult, Provisioner } from "./provisioner.js";
 
 const CONFIG_FILENAME = "openclaw.json";
+const PLUGIN_FILENAME = "clawdly-profile.js";
+const PLUGIN_MANIFEST_FILENAME = "openclaw.plugin.json";
 const LABEL_ROLE = "clawdly.role";
 const LABEL_USER = "clawdly.user";
 const GATEWAY_ROLE = "gateway";
@@ -26,26 +28,57 @@ const GATEWAY_ENV_PASSTHROUGH = [
   "TOGETHER_API_KEY",
   "PERPLEXITY_API_KEY",
   "CEREBRAS_API_KEY",
+  "NVIDIA_API_KEY",
 ] as const;
 
 const DEFAULT_TOOLS_PROFILE = "minimal";
 
+// ---------------------------------------------------------------------------
+// Model strategy (all free options prioritised first)
+//
+// best/premium: Kimi K2.5 (free 671B coding champion) → Gemini Pro (free 1M ctx)
+//               → Gemini Flash (free, fast) → Nemotron Ultra (free 253B)
+//               → Groq 70B (free*) → GPT-4o-mini (cheap last resort)
+//
+// fast:         Gemini Flash (free, fast, smart 1M ctx) → Groq 8B (free*, ultra-fast)
+//               → Nemotron Nano (free) → GPT-4o-mini (cheap last resort)
+//
+// NOTE: Groq is not a native LLM provider in OpenClaw — it is configured as a
+// custom openai-completions provider below so the model IDs resolve correctly.
+// ---------------------------------------------------------------------------
+
 const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
-  best: "groq/llama-3.3-70b-versatile",
-  fast: "groq/llama-3.1-8b-instant",
-  premium: "groq/llama-3.3-70b-versatile",
+  best: "nvidia/moonshotai/kimi-k2.5",
+  fast: "google/gemini-3-flash-preview",
+  premium: "nvidia/moonshotai/kimi-k2.5",
 };
 
 const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
-  best: ["groq/llama-3.1-8b-instant"],
-  fast: ["groq/llama-3.3-70b-versatile"],
-  premium: ["groq/llama-3.1-8b-instant"],
+  best: [
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+  ],
+  fast: [
+    "groq/llama-3.1-8b-instant",
+    "nvidia/nvidia/llama-3.1-nemotron-nano-8b-v1",
+    "openai/gpt-4o-mini",
+  ],
+  premium: [
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+  ],
 };
 
 const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
-  best: 16_000,
-  fast: 16_000,
-  premium: 16_000,
+  best: 131_072,
+  fast: 32_000,
+  premium: 131_072,
 };
 
 const normalizeOrigin = (value: string | null | undefined) => {
@@ -115,9 +148,72 @@ const buildConfig = (
     },
   },
   plugins: {
+    load: {
+      paths: [authDir],
+    },
     entries: {
       whatsapp: {
         enabled: true,
+      },
+      "clawdly-profile": {
+        enabled: true,
+      },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      // Nvidia NIM — free tier, hosts Kimi K2.5 and Nemotron family
+      nvidia: {
+        baseUrl: "https://integrate.api.nvidia.com/v1",
+        apiKey: "${NVIDIA_API_KEY}",
+        api: "openai-completions",
+        models: [
+          {
+            id: "moonshotai/kimi-k2.5",
+            name: "Kimi K2.5",
+            input: ["text"],
+            contextWindow: 131072,
+            maxTokens: 8192,
+          },
+          {
+            id: "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+            name: "Nemotron Ultra 253B",
+            input: ["text"],
+            contextWindow: 131072,
+            maxTokens: 16384,
+          },
+          {
+            id: "nvidia/llama-3.1-nemotron-nano-8b-v1",
+            name: "Nemotron Nano 8B",
+            input: ["text"],
+            contextWindow: 131072,
+            maxTokens: 8192,
+          },
+        ],
+      },
+      // Groq — not a native LLM provider in this OpenClaw build; configured as
+      // openai-completions so groq/* model IDs resolve correctly.
+      groq: {
+        baseUrl: "https://api.groq.com/openai/v1",
+        apiKey: "${GROQ_API_KEY}",
+        api: "openai-completions",
+        models: [
+          {
+            id: "llama-3.3-70b-versatile",
+            name: "Llama 3.3 70B Versatile",
+            input: ["text"],
+            contextWindow: 128000,
+            maxTokens: 8192,
+          },
+          {
+            id: "llama-3.1-8b-instant",
+            name: "Llama 3.1 8B Instant",
+            input: ["text"],
+            contextWindow: 128000,
+            maxTokens: 8192,
+          },
+        ],
       },
     },
   },
@@ -132,8 +228,162 @@ const buildConfig = (
   },
   tools: {
     profile: DEFAULT_TOOLS_PROFILE,
+    alsoAllow: ["get_user_profile", "update_user_profile", "memory_search", "memory_get"],
   },
 });
+
+// ---------------------------------------------------------------------------
+// Plugin source generator — writes the clawdly-profile.js plugin file into
+// the user's auth directory. Config constants are injected directly so the
+// plugin has no external dependency on the deploy server for its own config.
+// ---------------------------------------------------------------------------
+
+const buildPluginSource = (
+  userId: string,
+  gatewayToken: string,
+  deployServerUrl: string,
+): string => `// clawdly-profile.js
+// Auto-generated by the Clawdly deploy server. Do not edit manually.
+import { readFile } from "node:fs/promises";
+
+const CLAWDLY_USER_ID = ${JSON.stringify(userId)};
+const CLAWDLY_GATEWAY_TOKEN = ${JSON.stringify(gatewayToken)};
+const CLAWDLY_DEPLOY_URL = ${JSON.stringify(deployServerUrl)};
+const PROFILE_FILE = "/data/auth/memory/user-profile.md";
+
+export default function register(api) {
+  console.log("[clawdly-profile] plugin registered for userId=" + CLAWDLY_USER_ID);
+
+  // Inject the user profile into the system prompt on every turn.
+  // Using systemPrompt (not prependContext) keeps the profile invisible in the
+  // chat UI — it is appended to OpenClaw's built-in system prompt and never
+  // shows up as part of the user's message turn.
+  api.on("before_agent_start", async (_event) => {
+    try {
+      const profileMd = await readFile(PROFILE_FILE, "utf-8");
+      if (profileMd && profileMd.trim().length > 0) {
+        console.log("[clawdly-profile] before_agent_start: injecting profile via systemPrompt (" + profileMd.length + " chars)");
+        return {
+          systemPrompt:
+            "---\\n### What you know about this person\\n" +
+            profileMd +
+            "\\n---",
+        };
+      } else {
+        console.log("[clawdly-profile] before_agent_start: profile file empty — no context injected");
+      }
+    } catch (err) {
+      console.log("[clawdly-profile] before_agent_start: profile not available yet (" + String(err?.code ?? err) + ")");
+    }
+  });
+
+  // Forward each inbound message to the deploy server for profile enrichment.
+  // event shape: { from: string, content: string, timestamp?: number }
+  api.on("message_received", async (event) => {
+    if (!CLAWDLY_USER_ID || !CLAWDLY_DEPLOY_URL) return;
+    const content = typeof event?.content === "string" ? event.content : "";
+    console.log("[clawdly-profile] message_received: forwarding event contentLen=" + content.length);
+    try {
+      const resp = await fetch(
+        \`\${CLAWDLY_DEPLOY_URL}/v1/internal/profile-events/\${encodeURIComponent(CLAWDLY_USER_ID)}\`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: \`Bearer \${CLAWDLY_GATEWAY_TOKEN}\`,
+          },
+          body: JSON.stringify({
+            type: "message",
+            content: content.slice(0, 4000),
+            direction: "inbound",
+            timestamp: new Date().toISOString(),
+          }),
+        },
+      );
+      if (!resp.ok) {
+        console.warn("[clawdly-profile] message_received: deploy server returned " + resp.status);
+      }
+    } catch (err) {
+      console.warn("[clawdly-profile] message_received: fetch failed: " + String(err));
+      // Non-critical — never block the agent turn.
+    }
+  });
+
+  // Tool: retrieve the current profile.
+  // parameters (not inputSchema); execute returns { content: [{ type, text }] }.
+  api.registerTool({
+    name: "get_user_profile",
+    description:
+      "Retrieve everything you know about this person — profile, personality, relationships, goals, and recent context. Call this when you need to recall who you are talking to.",
+    parameters: { type: "object", properties: {} },
+    execute: async () => {
+      try {
+        const md = await readFile(PROFILE_FILE, "utf-8");
+        console.log("[clawdly-profile] get_user_profile: read " + md.length + " chars");
+        return { content: [{ type: "text", text: md || "Profile not yet available." }] };
+      } catch (err) {
+        console.warn("[clawdly-profile] get_user_profile: could not read profile: " + String(err?.code ?? err));
+        return { content: [{ type: "text", text: "Profile not yet available." }] };
+      }
+    },
+  });
+
+  // Tool: add a fact or note to the profile.
+  api.registerTool({
+    name: "update_user_profile",
+    description:
+      "Save a new fact or note about this person so it is remembered in future conversations. Use when you learn something important.",
+    parameters: {
+      type: "object",
+      properties: {
+        note: {
+          type: "string",
+          description: "The fact or note to add to the user profile.",
+        },
+      },
+      required: ["note"],
+    },
+    execute: async (_toolCallId, params) => {
+      console.log("[clawdly-profile] update_user_profile: note=" + String(params.note).slice(0, 80));
+      if (!CLAWDLY_USER_ID || !CLAWDLY_DEPLOY_URL) {
+        console.warn("[clawdly-profile] update_user_profile: missing userId or deployUrl — cannot update");
+        return { content: [{ type: "text", text: "Profile update not available." }] };
+      }
+      try {
+        const resp = await fetch(
+          \`\${CLAWDLY_DEPLOY_URL}/v1/internal/profile-events/\${encodeURIComponent(CLAWDLY_USER_ID)}\`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: \`Bearer \${CLAWDLY_GATEWAY_TOKEN}\`,
+            },
+            body: JSON.stringify({
+              type: "agent_note",
+              content: params.note,
+              timestamp: new Date().toISOString(),
+            }),
+          },
+        );
+        console.log("[clawdly-profile] update_user_profile: deploy server responded " + resp.status);
+        return {
+          content: [
+            {
+              type: "text",
+              text: resp.ok
+                ? "Got it — noted for future conversations."
+                : "Could not save the note right now.",
+            },
+          ],
+        };
+      } catch (err) {
+        console.warn("[clawdly-profile] update_user_profile: fetch failed: " + String(err));
+        return { content: [{ type: "text", text: "Could not save the note right now." }] };
+      }
+    },
+  });
+}
+`;
 
 const resolveGatewayProviderEnv = () =>
   GATEWAY_ENV_PASSTHROUGH.flatMap((name) => {
@@ -207,9 +457,9 @@ export class DockerProvisioner implements Provisioner {
       containerName,
     });
 
-    // 2. Write openclaw.json config
+    // 2. Write openclaw.json config + plugin file
     const gatewayAuthDir = this.resolveGatewayAuthDir(userId);
-    await this.writeConfigFile(authDir, gatewayAuthDir, whatsappId, gatewayToken, options?.modelTier);
+    await this.writeConfigFile(authDir, gatewayAuthDir, whatsappId, gatewayToken, userId, options?.modelTier);
     await this.ensureAuthOwnership(authDir);
 
     // 3. Remove any stale container with this name (idempotent)
@@ -227,6 +477,12 @@ export class DockerProvisioner implements Provisioner {
     const hostConfig: Docker.ContainerCreateOptions["HostConfig"] = {
       Mounts: mounts,
       RestartPolicy: { Name: "unless-stopped" },
+      // Give Chromium enough shared memory (Docker default 64 MB is too small and
+      // causes renderer crashes). 512 MB matches what most headful-Chrome setups need.
+      ShmSize: 512 * 1024 * 1024,
+      // Cap container RAM to prevent host OOM kills while allowing swap as a buffer.
+      Memory: 4 * 1024 * 1024 * 1024,
+      MemorySwap: -1,
     };
     if (this.opts.network) {
       hostConfig.NetworkMode = this.opts.network;
@@ -429,12 +685,39 @@ export class DockerProvisioner implements Provisioner {
     gatewayAuthDir: string,
     whatsappId: string,
     gatewayToken: string,
+    userId: string,
     modelTier?: ModelTier,
   ) {
     await fs.mkdir(hostAuthDir, { recursive: true });
     const config = buildConfig(gatewayAuthDir, whatsappId, gatewayToken, modelTier);
+    const primary = resolvePrimaryModel(modelTier);
+    const fallbacks = resolveModelFallbacks(modelTier);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[provisioner] writing config for userId=${userId} tier=${modelTier ?? "best"} ` +
+      `model.primary=${primary} model.fallbacks=[${fallbacks.join(", ")}] ` +
+      `contextTokens=${resolveContextTokens(modelTier)}`,
+    );
     const configPath = path.join(hostAuthDir, CONFIG_FILENAME);
     await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
+
+    // Write the per-user plugin file and its manifest alongside openclaw.json.
+    // The plugin is discovered via plugins.load.paths in the config above.
+    const pluginSource = buildPluginSource(userId, gatewayToken, deployConfig.internalUrl);
+    const pluginPath = path.join(hostAuthDir, PLUGIN_FILENAME);
+    await fs.writeFile(pluginPath, pluginSource, "utf-8");
+    // eslint-disable-next-line no-console
+    console.log(`[provisioner] plugin written to ${pluginPath}`);
+
+    // OpenClaw requires an openclaw.plugin.json manifest in the same rootDir as the plugin file.
+    const pluginManifest = {
+      id: "clawdly-profile",
+      configSchema: { type: "object", additionalProperties: false, properties: {} },
+    };
+    const pluginManifestPath = path.join(hostAuthDir, PLUGIN_MANIFEST_FILENAME);
+    await fs.writeFile(pluginManifestPath, JSON.stringify(pluginManifest, null, 2), "utf-8");
+    // eslint-disable-next-line no-console
+    console.log(`[provisioner] plugin manifest written to ${pluginManifestPath}`);
   }
 
   private async ensureAuthOwnership(authDir: string): Promise<void> {

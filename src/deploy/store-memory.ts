@@ -4,6 +4,8 @@ import type {
   AgentSettings,
   GatewayInstanceRecord,
   LoginSession,
+  ProfileDataRecord,
+  RawProfileData,
   UserRecord,
 } from "./types.js";
 import type { DeployStore, LoginSessionUpdate } from "./store.js";
@@ -14,6 +16,7 @@ export class MemoryStore implements DeployStore {
   private usersByWhatsapp = new Map<string, string>();
   private agents = new Map<string, AgentRecord>();
   private gateways = new Map<string, GatewayInstanceRecord>();
+  private profileData = new Map<string, ProfileDataRecord>();
 
   async createLoginSession(session: LoginSession): Promise<LoginSession> {
     this.sessions.set(session.id, session);
@@ -175,6 +178,44 @@ export class MemoryStore implements DeployStore {
       }
     }
     return count;
+  }
+
+  async upsertRawProfileData(userId: string, data: RawProfileData): Promise<void> {
+    const existing = this.profileData.get(userId);
+    this.profileData.set(userId, {
+      userId,
+      displayName: data.displayName ?? existing?.displayName ?? null,
+      contactsJson: data.contacts && data.contacts.length > 0
+        ? JSON.stringify(data.contacts)
+        : (existing?.contactsJson ?? null),
+      chatsJson: data.chats && data.chats.length > 0
+        ? JSON.stringify(data.chats)
+        : (existing?.chatsJson ?? null),
+      messagesJson: data.messages && data.messages.length > 0
+        ? JSON.stringify(data.messages)
+        : (existing?.messagesJson ?? null),
+      profileMd: existing?.profileMd ?? null,
+      profileUpdatedAt: existing?.profileUpdatedAt ?? null,
+      rawUpdatedAt: new Date(),
+    });
+  }
+
+  async getProfileData(userId: string): Promise<ProfileDataRecord | null> {
+    return this.profileData.get(userId) ?? null;
+  }
+
+  async upsertProfileMd(userId: string, profileMd: string): Promise<void> {
+    const existing = this.profileData.get(userId);
+    this.profileData.set(userId, {
+      userId,
+      displayName: existing?.displayName ?? null,
+      contactsJson: existing?.contactsJson ?? null,
+      chatsJson: existing?.chatsJson ?? null,
+      messagesJson: existing?.messagesJson ?? null,
+      profileMd,
+      profileUpdatedAt: new Date(),
+      rawUpdatedAt: existing?.rawUpdatedAt ?? new Date(),
+    });
   }
 
   async updateGatewayInstanceStatus(

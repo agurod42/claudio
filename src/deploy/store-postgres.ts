@@ -5,6 +5,8 @@ import type {
   AgentSettings,
   GatewayInstanceRecord,
   LoginSession,
+  ProfileDataRecord,
+  RawProfileData,
   SessionErrorCode,
   UserRecord,
 } from "./types.js";
@@ -319,5 +321,62 @@ export class PostgresStore implements DeployStore {
       [before],
     );
     return result.rowCount ?? 0;
+  }
+
+  async upsertRawProfileData(userId: string, data: RawProfileData): Promise<void> {
+    const id = `pd_${randomUUID()}`;
+    await this.pool.query(
+      `insert into user_profile_data
+      (id, user_id, display_name, contacts_json, chats_json, messages_json, raw_updated_at)
+      values ($1, $2, $3, $4, $5, $6, now())
+      on conflict (user_id) do update set
+        display_name = coalesce(excluded.display_name, user_profile_data.display_name),
+        contacts_json = coalesce(excluded.contacts_json, user_profile_data.contacts_json),
+        chats_json = coalesce(excluded.chats_json, user_profile_data.chats_json),
+        messages_json = coalesce(excluded.messages_json, user_profile_data.messages_json),
+        raw_updated_at = now()`,
+      [
+        id,
+        userId,
+        data.displayName ?? null,
+        data.contacts && data.contacts.length > 0 ? JSON.stringify(data.contacts) : null,
+        data.chats && data.chats.length > 0 ? JSON.stringify(data.chats) : null,
+        data.messages && data.messages.length > 0 ? JSON.stringify(data.messages) : null,
+      ],
+    );
+  }
+
+  async getProfileData(userId: string): Promise<ProfileDataRecord | null> {
+    const result = await this.pool.query(
+      "select * from user_profile_data where user_id = $1",
+      [userId],
+    );
+    if (!result.rowCount) {
+      return null;
+    }
+    const row = result.rows[0];
+    return {
+      userId: String(row.user_id),
+      displayName: row.display_name ? String(row.display_name) : null,
+      contactsJson: row.contacts_json ? String(row.contacts_json) : null,
+      chatsJson: row.chats_json ? String(row.chats_json) : null,
+      messagesJson: row.messages_json ? String(row.messages_json) : null,
+      profileMd: row.profile_md ? String(row.profile_md) : null,
+      profileUpdatedAt: row.profile_updated_at ? parseDate(row.profile_updated_at) : null,
+      rawUpdatedAt: parseDate(row.raw_updated_at),
+    };
+  }
+
+  async upsertProfileMd(userId: string, profileMd: string): Promise<void> {
+    const id = `pd_${randomUUID()}`;
+    await this.pool.query(
+      `insert into user_profile_data
+      (id, user_id, profile_md, profile_updated_at)
+      values ($1, $2, $3, now())
+      on conflict (user_id) do update set
+        profile_md = excluded.profile_md,
+        profile_updated_at = now()`,
+      [id, userId, profileMd],
+    );
   }
 }

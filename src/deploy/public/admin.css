@@ -294,3 +294,213 @@ th {
     min-width: 180px;
   }
 }
+
+/* ── Profile modal ─────────────────────────────────────────── */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(31, 35, 31, 0.45);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px 48px;
+  z-index: 1000;
+  overflow-y: auto;
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 100%;
+  max-width: 680px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 24px 24px 0;
+}
+
+.modal-title {
+  margin: 4px 0 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.modal-meta {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.modal-header-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.modal-close {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px;
+}
+
+.modal-close:hover {
+  background: var(--bg);
+}
+
+.modal-tabs {
+  display: flex;
+  padding: 14px 24px 0;
+  border-bottom: 1px solid var(--border);
+  gap: 0;
+}
+
+.modal-tab {
+  border: none;
+  background: none;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.modal-tab:hover {
+  color: var(--ink);
+}
+
+.modal-tab-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 500;
+}
+
+.modal-body {
+  padding: 20px 24px 28px;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+/* WA Capture tab */
+.wa-capture-section {
+  margin-bottom: 20px;
+}
+
+.wa-capture-section h4 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.9px;
+  color: var(--muted);
+}
+
+.wa-capture-count {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.wa-name-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wa-name-list li {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  margin: 0;
+}
+
+.wa-msg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wa-msg {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  max-width: 90%;
+  line-height: 1.4;
+}
+
+.wa-msg-me {
+  background: var(--accent-soft);
+  align-self: flex-end;
+  text-align: right;
+}
+
+.wa-msg-them {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  align-self: flex-start;
+}
+
+.modal-body .profile-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.modal-body h3 {
+  margin: 20px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent);
+}
+
+.modal-body h3:first-child {
+  margin-top: 0;
+}
+
+.modal-body ul {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+
+.modal-body li {
+  margin-bottom: 4px;
+}
+
+.modal-body p {
+  margin: 0 0 10px;
+}
+
+.modal-body strong {
+  font-weight: 600;
+}

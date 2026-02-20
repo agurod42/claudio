@@ -7,6 +7,7 @@ export type LoginWorkerDeps = {
   store: DeployStore;
   events: SessionEvents;
   sessionTtlMs: number;
+  onProfileDataReady?: (userId: string) => void;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -55,12 +56,23 @@ export const runLoginWorker = async (
   session: LoginSession,
   deps: LoginWorkerDeps,
 ): Promise<void> => {
-  const { store, events, sessionTtlMs } = deps;
+  const { store, events, sessionTtlMs, onProfileDataReady } = deps;
   const expiresAt = session.expiresAt;
   let completed = false;
   let timeout: NodeJS.Timeout | null = null;
   let sock: Awaited<ReturnType<typeof createWaSocket>> | null = null;
   const maxAttempts = 3;
+
+  // Accumulate WhatsApp sync data emitted by Baileys during session establishment.
+  // These events fire during the connection hold window and give us rich context
+  // about the user (contacts, chats, recent messages) for profile synthesis.
+  let capturedUserId: string | null = null;
+  const syncData = {
+    displayName: null as string | null,
+    contacts: [] as unknown[],
+    chats: [] as unknown[],
+    messages: [] as unknown[],
+  };
 
   const handleExpire = async () => {
     if (completed) {
@@ -103,6 +115,7 @@ export const runLoginWorker = async (
       return false;
     }
     const user = await store.getOrCreateUserByWhatsappId(e164);
+    capturedUserId = user.id;
     await store.updateLoginSession(session.id, {
       state: "linked",
       whatsappId: e164,
@@ -125,9 +138,17 @@ export const runLoginWorker = async (
     timeout = setTimeout(handleExpire, sessionTtlMs);
 
     let lastError: unknown = null;
+    let connected = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let connectedSockEv: any = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       sock = await createWaSocket(false, false, {
         authDir: session.authDir,
+        // syncFullHistory:true tells Baileys to process HISTORY_SYNC_NOTIFICATION messages
+        // from WA instead of discarding them. Without this, shouldSyncHistoryMessage()
+        // returns false and messaging-history.set is never emitted even if WA sends it
+        // (which it does right after a fresh QR scan — visible as "syncing" on the phone).
+        syncFullHistory: true,
         onQr: async (qr) => {
           if (completed) {
             return;
@@ -140,13 +161,57 @@ export const runLoginWorker = async (
         },
       });
 
+      // Attach sync event listeners immediately after socket creation.
+      // Baileys fires these during and shortly after the handshake, giving us
+      // the user's contact list, chat list, and recent message history.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const sockEv = (sock as any)?.ev;
+      if (sockEv) {
+        // Primary: Baileys v7 bulk-sync event (only arrives when WA sends HISTORY_SYNC_NOTIFICATION)
+        sockEv.on(
+          "messaging-history.set",
+          ({ contacts, chats, messages }: { contacts: unknown[]; chats: unknown[]; messages: unknown[] }) => {
+            syncData.contacts = (contacts ?? []).slice(0, 500);
+            syncData.chats = (chats ?? []).slice(0, 200);
+            syncData.messages = (messages ?? []).slice(0, 1000);
+            // eslint-disable-next-line no-console
+            console.log(`[login-worker] messaging-history.set: ${syncData.contacts.length} contacts, ${syncData.chats.length} chats, ${syncData.messages.length} messages`);
+          },
+        );
+        // Fallback: incremental upsert events that fire even without a history sync notification.
+        // WA pushes these during and after the initial handshake regardless of syncFullHistory.
+        sockEv.on("chats.upsert", (chats: unknown[]) => {
+          if (chats?.length) {
+            syncData.chats = [...syncData.chats, ...chats].slice(0, 200);
+          }
+        });
+        sockEv.on("contacts.upsert", (contacts: unknown[]) => {
+          if (contacts?.length) {
+            syncData.contacts = [...syncData.contacts, ...contacts].slice(0, 500);
+          }
+        });
+      }
+
       try {
         await waitForWaConnection(sock);
+        connected = true;
+        connectedSockEv = sockEv;
         break;
       } catch (err) {
         lastError = err;
         // Some WA flows persist creds but disconnect before `open`.
+        // This is normal in WA's multi-device reconnect flow: creds.json is
+        // written during the handshake, then WA immediately closes the socket
+        // before firing "open". If credentials are already on disk, retry the
+        // connection instead of returning early — the next attempt will open
+        // cleanly and fire messaging-history.set for profile capture.
         if (await linkFromAuthDir()) {
+          if (attempt < maxAttempts) {
+            // eslint-disable-next-line no-console
+            console.log(`[login-worker] creds arrived during reconnect (attempt ${attempt}), retrying for sync data`);
+            await sleep(500);
+            continue;
+          }
           completed = true;
           return;
         }
@@ -161,7 +226,10 @@ export const runLoginWorker = async (
         }
         throw err;
       } finally {
-        if (!completed) {
+        // Only close the socket on error/retry, not on success.
+        // On success we need the socket to stay open so Baileys can
+        // sync session state (pre-keys, sender-keys, app-state-sync-keys).
+        if (!completed && !connected) {
           closeSocket();
           sock = null;
         }
@@ -171,6 +239,55 @@ export const runLoginWorker = async (
     if (completed) {
       return;
     }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    syncData.displayName = (sock as any)?.user?.name ?? null;
+    // eslint-disable-next-line no-console
+    console.log(`[login-worker] connected displayName=${syncData.displayName ?? "(none)"}, waiting for sync events`);
+
+    // Wait for sync events from WA. Exit early once we have contacts or chats from
+    // any source: messaging-history.set (bulk), chats.upsert, or contacts.upsert.
+    //
+    // WHY 90s: WA sends HISTORY_SYNC_NOTIFICATION to "the next stable connection"
+    // after device registration. That connection is US — but only while our socket
+    // is open. If we close too early (e.g. 45s), WA defers the notification to the
+    // next connection, which is the gateway container starting at ~t+55s. The gateway
+    // then consumes the notification, and our deferred sync (3 min later) gets nothing.
+    //
+    // Baileys' own internal AwaitingInitialSync timeout fires at 20s and transitions
+    // to Online state. After that, a late HISTORY_SYNC_NOTIFICATION is still processed
+    // by processMessage and emits messaging-history.set immediately (no buffering).
+    // Our listener below catches it. So 90s keeps the socket alive long enough to
+    // capture notifications that arrive at ~60-80s after QR scan.
+    //
+    // The early-exit logic means we return immediately when data arrives — typical
+    // fast accounts resolve in seconds, not the full 90s.
+    const SYNC_TIMEOUT_MS = 90_000;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (reason: string) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        // eslint-disable-next-line no-console
+        console.log(`[login-worker] sync wait ended (${reason}) — contacts=${syncData.contacts.length} chats=${syncData.chats.length} messages=${syncData.messages.length}`);
+        resolve();
+      };
+      const timer = setTimeout(() => finish("timeout"), SYNC_TIMEOUT_MS);
+      const tryEarlyExit = (source: string) => {
+        if (syncData.contacts.length > 0 || syncData.chats.length > 0) {
+          finish(source);
+        }
+      };
+      tryEarlyExit("already-received"); // in case events fired before this promise
+      if (connectedSockEv) {
+        connectedSockEv.on("messaging-history.set", () => setTimeout(() => tryEarlyExit("messaging-history.set"), 100));
+        connectedSockEv.on("chats.upsert", () => setTimeout(() => tryEarlyExit("chats.upsert"), 100));
+        connectedSockEv.on("contacts.upsert", () => setTimeout(() => tryEarlyExit("contacts.upsert"), 100));
+      }
+    });
+    closeSocket();
+    sock = null;
 
     // Give auth state a brief chance to flush to disk after socket open.
     let linked = false;
@@ -186,6 +303,14 @@ export const runLoginWorker = async (
         formatLoginError(lastError) || "WhatsApp linked but identity was not persisted.",
       );
     }
+
+    // Persist the WhatsApp sync data collected during the hold window.
+    // Fire-and-forget — don't block the login flow on DB write.
+    if (capturedUserId) {
+      void store.upsertRawProfileData(capturedUserId, syncData).catch(() => {});
+      onProfileDataReady?.(capturedUserId);
+    }
+
     completed = true;
   } catch (err) {
     if (completed) {

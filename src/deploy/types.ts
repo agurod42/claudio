@@ -66,3 +66,21 @@ export type GatewayInstanceRecord = {
   gatewayToken: string;
   createdAt: Date;
 };
+
+export type RawProfileData = {
+  displayName?: string | null;
+  contacts?: unknown[];
+  chats?: unknown[];
+  messages?: unknown[];
+};
+
+export type ProfileDataRecord = {
+  userId: string;
+  displayName: string | null;
+  contactsJson: string | null;
+  chatsJson: string | null;
+  messagesJson: string | null;
+  profileMd: string | null;
+  profileUpdatedAt: Date | null;
+  rawUpdatedAt: Date;
+};

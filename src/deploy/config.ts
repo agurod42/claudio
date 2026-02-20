@@ -44,4 +44,7 @@ export const deployConfig = {
   adminToken: process.env.OPENCLAW_DEPLOY_ADMIN_TOKEN ?? "",
   reaperIntervalMs: parseNumber(process.env.OPENCLAW_DEPLOY_REAPER_INTERVAL_MS, 10 * 60 * 1000),
   reaperMaxAgeMs: parseNumber(process.env.OPENCLAW_DEPLOY_REAPER_TTL_MS, 6 * 60 * 60 * 1000),
+  // URL that gateway containers use to call back to this deploy server.
+  // Must be reachable from inside the Docker network (e.g. http://deploy:8080).
+  internalUrl: process.env.OPENCLAW_DEPLOY_INTERNAL_URL ?? "http://deploy:8080",
 };

@@ -6,6 +6,8 @@ import type {
   AgentSettings,
   GatewayInstanceRecord,
   LoginSession,
+  ProfileDataRecord,
+  RawProfileData,
   SessionErrorCode,
   SessionState,
   UserRecord,
@@ -46,6 +48,9 @@ export interface DeployStore {
     containerId?: string | null,
   ): Promise<GatewayInstanceRecord | null>;
   deleteExpiredLoginSessions(before: Date): Promise<number>;
+  upsertRawProfileData(userId: string, data: RawProfileData): Promise<void>;
+  getProfileData(userId: string): Promise<ProfileDataRecord | null>;
+  upsertProfileMd(userId: string, profileMd: string): Promise<void>;
 }
 
 export const createStore = (pool: Pool | null): DeployStore => {

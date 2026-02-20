@@ -93,6 +93,28 @@
       </section>
     </div>
 
+    <!-- Profile modal -->
+    <div id="profile-modal" class="modal-overlay" hidden>
+      <div class="modal-card">
+        <div class="modal-header">
+          <div>
+            <div class="eyebrow">User Profile</div>
+            <h2 id="profile-modal-title" class="modal-title">—</h2>
+            <p id="profile-modal-meta" class="modal-meta"></p>
+          </div>
+          <div class="modal-header-actions">
+            <button id="profile-modal-resynthesize" class="ghost-btn" type="button">Resynthesize</button>
+            <button id="profile-modal-close" class="modal-close" type="button" aria-label="Close">✕</button>
+          </div>
+        </div>
+        <div class="modal-tabs">
+          <button class="modal-tab modal-tab-active" data-tab="profile">Synthesised Profile</button>
+          <button class="modal-tab" data-tab="rawdata">WA Capture</button>
+        </div>
+        <div id="profile-modal-body" class="modal-body" data-active-tab="profile"></div>
+      </div>
+    </div>
+
     <script src="/admin.js"></script>
   </body>
 </html>
