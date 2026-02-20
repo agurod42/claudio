@@ -173,22 +173,45 @@ const resolveDefaultControlUiAllowedOrigins = () => {
 
 const DEFAULT_TOOLS_PROFILE = "minimal";
 
+// ---------------------------------------------------------------------------
+// Model strategy — MUST stay in sync with provisioner-docker.ts.
+// ensureGatewayAgentModelConfig() patches existing openclaw.json on every
+// /v1/agent GET and PATCH, so drift here silently overwrites the richer
+// fallback list that provisioner writes on initial provisioning.
+// ---------------------------------------------------------------------------
+
 const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
   best: "nvidia/moonshotai/kimi-k2.5",
-  fast: "nvidia/nvidia/llama-3.1-nemotron-nano-8b-v1",
+  fast: "google/gemini-3-flash-preview",
   premium: "nvidia/moonshotai/kimi-k2.5",
 };
 
 const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
-  best: ["groq/llama-3.3-70b-versatile"],
-  fast: ["groq/llama-3.1-8b-instant"],
-  premium: ["groq/llama-3.3-70b-versatile"],
+  best: [
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+  ],
+  fast: [
+    "groq/llama-3.1-8b-instant",
+    "nvidia/nvidia/llama-3.1-nemotron-nano-8b-v1",
+    "openai/gpt-4o-mini",
+  ],
+  premium: [
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "groq/llama-3.3-70b-versatile",
+    "openai/gpt-4o-mini",
+  ],
 };
 
 const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
-  best: 128_000,
-  fast: 16_000,
-  premium: 128_000,
+  best: 131_072,
+  fast: 32_000,
+  premium: 131_072,
 };
 
 const resolvePrimaryModelForTier = (modelTier: ModelTier | undefined) =>

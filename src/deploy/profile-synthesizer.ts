@@ -4,8 +4,10 @@ import type { DeployStore } from "./store.js";
 import type { ModelTier } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Model resolution (mirrors provisioner-docker.ts tiers so profile synthesis
-// uses the same model family the user's agent uses)
+// Model resolution for profile synthesis LLM calls.
+// These are direct API calls made by the deploy server (not gateway config).
+// Model IDs here use each provider's native API format, which differs from
+// the gateway's openclaw.json provider-prefixed format (e.g. "groq/...").
 // ---------------------------------------------------------------------------
 
 // How many items to pull from the WhatsApp store per field.

@@ -47,7 +47,6 @@ export type UserRecord = {
 export type AgentRecord = {
   id: string;
   userId: string;
-  gatewayInstanceId: string | null;
   modelTier: ModelTier;
   name: string | null;
   tone: string | null;

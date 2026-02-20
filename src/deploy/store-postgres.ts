@@ -61,7 +61,6 @@ const mapUser = (row: QueryResultRow): UserRecord => ({
 const mapAgent = (row: QueryResultRow): AgentRecord => ({
   id: String(row.id),
   userId: String(row.user_id),
-  gatewayInstanceId: row.gateway_instance_id ? String(row.gateway_instance_id) : null,
   modelTier: row.model_tier,
   name: row.name ? String(row.name) : null,
   tone: row.tone ? String(row.tone) : null,

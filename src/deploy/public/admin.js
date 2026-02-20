@@ -585,12 +585,9 @@ const runDeprovision = async (userId) => {
     const data = await resp.json();
     const sessionsClosed =
       data && typeof data.sessionsClosed === "number" ? data.sessionsClosed : 0;
-    const hadContainer = Boolean(data?.gateway?.hadContainer);
     await loadOverview();
     setStatusText(
-      `Deprovisioned ${userLabel}. Closed ${sessionsClosed} session${sessionsClosed === 1 ? "" : "s"}${
-        hadContainer ? "; gateway container removed." : "."
-      }`,
+      `Deprovisioned ${userLabel}. Closed ${sessionsClosed} session${sessionsClosed === 1 ? "" : "s"}.`,
     );
   } catch {
     setStatusText(`Failed to deprovision ${userLabel}. Check server logs.`);

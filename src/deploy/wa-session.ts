@@ -93,8 +93,8 @@ export async function waitForWaConnection(sock: ReturnType<typeof makeWASocket>)
 
 // ---------------------------------------------------------------------------
 // Collect WhatsApp sync data using existing credentials (no QR needed).
-// Used during reprovision to seed the profile with real WhatsApp data for
-// users whose session was established before the capture code was added.
+// Used during reprovision to refresh the user profile with up-to-date
+// contacts, chats, and message history from WhatsApp.
 // IMPORTANT: the gateway container MUST be stopped before calling this to
 // avoid two simultaneous WhatsApp connections with the same credentials.
 // ---------------------------------------------------------------------------

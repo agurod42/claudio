@@ -90,7 +90,6 @@ export class MemoryStore implements DeployStore {
     const agent: AgentRecord = {
       id: `ag_${randomUUID()}`,
       userId,
-      gatewayInstanceId: null,
       modelTier: settings.modelTier,
       name: settings.name ?? null,
       tone: settings.tone ?? null,
