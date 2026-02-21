@@ -1,413 +1,170 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { DeployStore } from "./store.js";
-import type { ModelTier } from "./types.js";
-
-// ---------------------------------------------------------------------------
-// Model resolution for profile synthesis LLM calls.
-// These are direct API calls made by the deploy server (not gateway config).
-// Model IDs here use each provider's native API format, which differs from
-// the gateway's openclaw.json provider-prefixed format (e.g. "groq/...").
-// ---------------------------------------------------------------------------
-
-// How many items to pull from the WhatsApp store per field.
-// Larger models with more context get more data → better profile.
-type DataLimits = {
-  maxContacts: number;
-  maxChats: number;
-  maxMessages: number;
-};
-
-const LIMITS_SMALL: DataLimits = { maxContacts: 100, maxChats: 80, maxMessages: 150 };
-const LIMITS_MEDIUM: DataLimits = { maxContacts: 200, maxChats: 150, maxMessages: 500 };
-const LIMITS_LARGE: DataLimits = { maxContacts: 500, maxChats: 300, maxMessages: 2000 };
-
-type LlmProvider = {
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-  /** Controls how much WhatsApp data is fed into the prompt. */
-  limits: DataLimits;
-};
-
-// ---------------------------------------------------------------------------
-// Prioritise free, capable models; fall back to paid only as last resort.
-//
-// best/premium:  Nvidia Kimi K2.5 (free, 671B, best coding) →
-//                Google Gemini Flash (free, 1M ctx, sends 10x more data) →
-//                Groq 70B (free*, fast) → OpenAI gpt-4o-mini (cheap last resort)
-//
-// fast:          Google Gemini Flash (free, fast) →
-//                Groq 8B (free*, ultra-fast) → OpenAI gpt-4o-mini
-// ---------------------------------------------------------------------------
-
-const resolveProvider = (modelTier: ModelTier | undefined): LlmProvider | null => {
-  const groqKey = process.env.GROQ_API_KEY?.trim();
-  const nvidiaKey = process.env.NVIDIA_API_KEY?.trim();
-  const googleKey = process.env.GOOGLE_API_KEY?.trim();
-  const openaiKey = process.env.OPENAI_API_KEY?.trim();
-
-  // eslint-disable-next-line no-console
-  console.log(
-    `[synthesizer] key availability: NVIDIA=${!!nvidiaKey} GOOGLE=${!!googleKey} ` +
-    `GROQ=${!!groqKey} OPENAI=${!!openaiKey} tier=${modelTier ?? "best"}`,
-  );
-
-  if (modelTier === "fast") {
-    // Gemini Flash is the best free fast model — 1M context, smarter than 8B
-    if (googleKey) {
-      const p: LlmProvider = {
-        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-        apiKey: googleKey,
-        model: "gemini-2.0-flash",
-        limits: LIMITS_LARGE,
-      };
-      // eslint-disable-next-line no-console
-      console.log(`[synthesizer] selected provider: google model=${p.model} limits=large`);
-      return p;
-    }
-    if (groqKey) {
-      const p: LlmProvider = {
-        baseUrl: "https://api.groq.com/openai/v1",
-        apiKey: groqKey,
-        model: "llama-3.1-8b-instant",
-        limits: LIMITS_SMALL,
-      };
-      // eslint-disable-next-line no-console
-      console.log(`[synthesizer] selected provider: groq model=${p.model} limits=small`);
-      return p;
-    }
-    if (nvidiaKey) {
-      const p: LlmProvider = {
-        baseUrl: "https://integrate.api.nvidia.com/v1",
-        apiKey: nvidiaKey,
-        model: "nvidia/llama-3.1-nemotron-nano-8b-v1",
-        limits: LIMITS_SMALL,
-      };
-      // eslint-disable-next-line no-console
-      console.log(`[synthesizer] selected provider: nvidia model=${p.model} limits=small`);
-      return p;
-    }
-    if (openaiKey) {
-      const p: LlmProvider = {
-        baseUrl: "https://api.openai.com/v1",
-        apiKey: openaiKey,
-        model: "gpt-4o-mini",
-        limits: LIMITS_SMALL,
-      };
-      // eslint-disable-next-line no-console
-      console.log(`[synthesizer] selected provider: openai model=${p.model} limits=small`);
-      return p;
-    }
-  }
-
-  // best / premium — Kimi K2.5 first (best at social analysis + coding),
-  // then Gemini Flash (more data fits in its 1M context window),
-  // then Groq 70B, finally OpenAI mini as cheap last resort.
-  if (nvidiaKey) {
-    const p: LlmProvider = {
-      baseUrl: "https://integrate.api.nvidia.com/v1",
-      apiKey: nvidiaKey,
-      model: "moonshotai/kimi-k2.5",
-      limits: LIMITS_MEDIUM,
-    };
-    // eslint-disable-next-line no-console
-    console.log(`[synthesizer] selected provider: nvidia model=${p.model} limits=medium`);
-    return p;
-  }
-  if (googleKey) {
-    const p: LlmProvider = {
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-      apiKey: googleKey,
-      model: "gemini-2.0-flash",
-      limits: LIMITS_LARGE,
-    };
-    // eslint-disable-next-line no-console
-    console.log(`[synthesizer] selected provider: google model=${p.model} limits=large`);
-    return p;
-  }
-  if (groqKey) {
-    const p: LlmProvider = {
-      baseUrl: "https://api.groq.com/openai/v1",
-      apiKey: groqKey,
-      model: "llama-3.3-70b-versatile",
-      limits: LIMITS_MEDIUM,
-    };
-    // eslint-disable-next-line no-console
-    console.log(`[synthesizer] selected provider: groq model=${p.model} limits=medium`);
-    return p;
-  }
-  if (openaiKey) {
-    const p: LlmProvider = {
-      baseUrl: "https://api.openai.com/v1",
-      apiKey: openaiKey,
-      model: "gpt-4o-mini",
-      limits: LIMITS_SMALL,
-    };
-    // eslint-disable-next-line no-console
-    console.log(`[synthesizer] selected provider: openai model=${p.model} limits=small`);
-    return p;
-  }
-  // eslint-disable-next-line no-console
-  console.warn("[synthesizer] no LLM keys configured — profile synthesis will be skipped");
-  return null;
-};
-
-// ---------------------------------------------------------------------------
-// Data preparation — compact summaries to fit in context
-// ---------------------------------------------------------------------------
+import { refreshBootstrapFromArtifacts } from "./profile-bootstrap.js";
 
 const safeJson = (json: string | null): unknown[] => {
-  if (!json) return [];
+  if (!json) {
+    return [];
+  }
   try {
-    const parsed = JSON.parse(json);
+    const parsed = JSON.parse(json) as unknown;
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
 };
 
+const normalizeLine = (value: string): string => value.replace(/\s+/g, " ").trim();
+
+const unique = (values: string[]): string[] => Array.from(new Set(values));
+
 const extractContactName = (contact: unknown): string | null => {
-  if (!contact || typeof contact !== "object") return null;
+  if (!contact || typeof contact !== "object") {
+    return null;
+  }
   const c = contact as Record<string, unknown>;
-  return (
+  const value =
     (typeof c.name === "string" && c.name.trim()) ||
     (typeof c.notify === "string" && c.notify.trim()) ||
     (typeof c.verifiedName === "string" && c.verifiedName.trim()) ||
-    null
-  );
+    null;
+  return value ? normalizeLine(value) : null;
 };
 
-const extractChatSummary = (chat: unknown): string | null => {
-  if (!chat || typeof chat !== "object") return null;
+const extractChatName = (chat: unknown): string | null => {
+  if (!chat || typeof chat !== "object") {
+    return null;
+  }
   const c = chat as Record<string, unknown>;
-  const name = (typeof c.name === "string" && c.name.trim()) || null;
-  if (!name) return null;
-  // Try to pull the last message text from the chat object (Baileys includes it)
-  const lastMsg = c.lastMessage as Record<string, unknown> | undefined;
-  const lastText = lastMsg ? extractMessageText(lastMsg) : null;
-  return lastText ? `${name}: "${lastText.slice(0, 120)}"` : name;
+  const value =
+    (typeof c.name === "string" && c.name.trim()) ||
+    (typeof c.subject === "string" && c.subject.trim()) ||
+    null;
+  return value ? normalizeLine(value) : null;
 };
 
 const extractMessageText = (msg: unknown): string | null => {
-  if (!msg || typeof msg !== "object") return null;
+  if (!msg || typeof msg !== "object") {
+    return null;
+  }
   const m = msg as Record<string, unknown>;
-  // Baileys message structure: msg.message.conversation or msg.message.extendedTextMessage.text
   const inner = m.message as Record<string, unknown> | undefined;
-  if (!inner) return null;
-  if (typeof inner.conversation === "string") return inner.conversation;
+  if (!inner) {
+    return null;
+  }
+  if (typeof inner.conversation === "string") {
+    return inner.conversation;
+  }
   const ext = inner.extendedTextMessage as Record<string, unknown> | undefined;
-  if (typeof ext?.text === "string") return ext.text;
+  if (typeof ext?.text === "string") {
+    return ext.text;
+  }
   return null;
 };
 
 const isOutbound = (msg: unknown): boolean => {
-  if (!msg || typeof msg !== "object") return false;
+  if (!msg || typeof msg !== "object") {
+    return false;
+  }
   const m = msg as Record<string, unknown>;
-  return m.key !== undefined &&
-    typeof (m.key as Record<string, unknown>)?.fromMe === "boolean" &&
-    (m.key as Record<string, unknown>)?.fromMe === true;
+  const key = m.key as Record<string, unknown> | undefined;
+  return key?.fromMe === true;
 };
 
-const buildDataSummary = (
-  displayName: string | null,
-  phone: string,
-  contactsJson: string | null,
-  chatsJson: string | null,
-  messagesJson: string | null,
-  limits: DataLimits,
-): string => {
-  const contacts = safeJson(contactsJson);
-  const chats = safeJson(chatsJson);
-  const messages = safeJson(messagesJson);
+const buildProjectedProfile = (params: {
+  whatsappId: string;
+  displayName: string | null;
+  contactsJson: string | null;
+  chatsJson: string | null;
+  messagesJson: string | null;
+}): string => {
+  const contacts = safeJson(params.contactsJson);
+  const chats = safeJson(params.chatsJson);
+  const messages = safeJson(params.messagesJson);
 
-  const parts: string[] = [];
-
-  parts.push(`## User identity\n- Display name: ${displayName ?? "(unknown)"}\n- Phone: ${phone}`);
-
-  if (contacts.length > 0) {
-    const names = contacts
+  const contactNames = unique(
+    contacts
       .map(extractContactName)
-      .filter((n): n is string => Boolean(n))
-      .slice(0, limits.maxContacts);
-    parts.push(`## Contacts (${names.length} of ${contacts.length} shown)\n${names.map((n) => `- ${n}`).join("\n")}`);
-  }
+      .filter((name): name is string => Boolean(name))
+      .slice(0, 40),
+  );
 
-  if (chats.length > 0) {
-    const chatSummaries = chats
-      .map(extractChatSummary)
-      .filter((n): n is string => Boolean(n))
-      .slice(0, limits.maxChats);
-    parts.push(`## Chats (${chatSummaries.length} of ${chats.length} shown)\n${chatSummaries.map((n) => `- ${n}`).join("\n")}`);
-  }
+  const chatNames = unique(
+    chats
+      .map(extractChatName)
+      .filter((name): name is string => Boolean(name))
+      .slice(0, 40),
+  );
 
-  if (messages.length > 0) {
-    const msgLines: string[] = [];
-    let count = 0;
-    for (const msg of messages) {
-      if (count >= limits.maxMessages) break;
+  const messageLines = messages
+    .map((msg) => {
       const text = extractMessageText(msg);
-      if (!text || text.trim().length === 0) continue;
+      if (!text || text.trim().length === 0) {
+        return null;
+      }
       const role = isOutbound(msg) ? "me" : "them";
-      msgLines.push(`[${role}]: ${text.trim().slice(0, 300)}`);
-      count++;
-    }
-    if (msgLines.length > 0) {
-      parts.push(`## Recent messages (${msgLines.length} shown)\n${msgLines.join("\n")}`);
-    }
+      return `- [${role}] ${normalizeLine(text).slice(0, 240)}`;
+    })
+    .filter((line): line is string => Boolean(line))
+    .slice(0, 30);
+
+  const sections: string[] = [
+    "## Identity",
+    `- Name: ${params.displayName ?? "Unknown"}`,
+    `- WhatsApp: ${params.whatsappId || "Unknown"}`,
+  ];
+
+  if (contactNames.length > 0) {
+    sections.push("", "## Known Contacts", ...contactNames.map((name) => `- ${name}`));
   }
 
-  return parts.join("\n\n");
+  if (chatNames.length > 0) {
+    sections.push("", "## Active Chats", ...chatNames.map((name) => `- ${name}`));
+  }
+
+  if (messageLines.length > 0) {
+    sections.push("", "## Recent Conversation Signals", ...messageLines);
+  }
+
+  sections.push(
+    "",
+    "## Notes",
+    "- This profile is projection-based from captured WhatsApp data and is refreshed automatically.",
+  );
+
+  return `${sections.join("\n")}\n`;
 };
 
-// ---------------------------------------------------------------------------
-// LLM call
-// ---------------------------------------------------------------------------
-
-const callLlm = async (provider: LlmProvider, userPrompt: string, label: string): Promise<string> => {
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] calling LLM for ${label}: model=${provider.model} promptLen=${userPrompt.length}`);
-  const systemPrompt = `You are building a personal profile for an AI assistant who will talk to this person daily.
-Your task: analyze the WhatsApp data below and write a Markdown profile that the assistant will use as context.
-
-CRITICAL RULES:
-1. You MUST produce a profile regardless of how much or how little data you have.
-2. NEVER say you need more data, chat exports, or anything else. Work with what is given.
-3. NEVER ask the user to provide anything. Just write the profile.
-4. If a section has no evidence, skip it entirely — do not mention the absence.
-5. From contact names and chat names alone you can infer: language(s), cultural background, relationship types (family group chats, work contacts), social circle breadth, and more. Use this.
-6. Be specific. Use actual names you see. Avoid vague filler like "has various contacts."
-
-Profile sections (only include sections where you have real evidence):
-- **Identity**: Name, phone, inferred language(s), estimated timezone/region
-- **Relationships**: people who appear — family, friends, colleagues (use names)
-- **Social & Communication**: group chats, conversation style inferred from message snippets
-- **Work & Professional Life**: anything suggesting job, company, role
-- **Interests & Context**: topics, recurring themes visible in chat names or messages
-- **Notes**: anything useful that doesn't fit above
-
-Write in third person ("Agu is…"). Be concise and factual. This profile will be prepended to the assistant's system prompt.`;
-
-  const response = await fetch(`${provider.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${provider.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: provider.model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      max_tokens: 2048,
-      temperature: 0.3,
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    const msg = `LLM API error ${response.status} (${provider.model}): ${body.slice(0, 300)}`;
-    // eslint-disable-next-line no-console
-    console.error(`[synthesizer] ${msg}`);
-    throw new Error(msg);
-  }
-
-  const data = await response.json() as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    // eslint-disable-next-line no-console
-    console.error(`[synthesizer] LLM returned empty content from ${provider.model}`);
-    throw new Error("LLM returned empty content");
-  }
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] LLM response received: model=${provider.model} outputLen=${content.length}`);
-  return content.trim();
-};
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-export const synthesizeUserProfile = async (
+export const projectUserProfile = async (
   userId: string,
   whatsappId: string,
   authDir: string,
-  modelTier: ModelTier | undefined,
   store: DeployStore,
   caller = "unknown",
 ): Promise<void> => {
   // eslint-disable-next-line no-console
-  console.log(`[synthesizer] starting profile synthesis for userId=${userId} tier=${modelTier ?? "best"} caller=${caller}`);
-
-  const provider = resolveProvider(modelTier);
-  if (!provider) {
-    // eslint-disable-next-line no-console
-    console.warn(`[synthesizer] skipping synthesis for userId=${userId}: no LLM provider available`);
-    return;
-  }
+  console.log(`[profile-projection] starting userId=${userId} caller=${caller}`);
 
   const profileData = await store.getProfileData(userId);
-  if (!profileData) {
-    // eslint-disable-next-line no-console
-    console.warn(`[synthesizer] skipping synthesis for userId=${userId}: no profile data in store yet`);
-    return;
-  }
-
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] profile data found for userId=${userId} displayName=${profileData.displayName ?? "(none)"}`);
-
-  const summary = buildDataSummary(
-    profileData.displayName,
+  const profileMd = buildProjectedProfile({
     whatsappId,
-    profileData.contactsJson,
-    profileData.chatsJson,
-    profileData.messagesJson,
-    provider.limits,
-  );
+    displayName: profileData?.displayName ?? null,
+    contactsJson: profileData?.contactsJson ?? null,
+    chatsJson: profileData?.chatsJson ?? null,
+    messagesJson: profileData?.messagesJson ?? null,
+  });
 
-  if (summary.trim().length === 0) {
-    // eslint-disable-next-line no-console
-    console.warn(`[synthesizer] skipping synthesis for userId=${userId}: data summary is empty`);
-    return;
-  }
-
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] built data summary for userId=${userId} summaryLen=${summary.length}`);
-
-  const userPrompt = `Here is the WhatsApp data for the person you will be assisting:\n\n${summary}\n\nPlease build their profile now.`;
-
-  const profileMd = await callLlm(provider, userPrompt, `userId=${userId}`);
-
-  // Write to the memory directory so the get_user_profile tool and admin panel can read it
   const memoryDir = path.join(authDir, "memory");
   await fs.mkdir(memoryDir, { recursive: true });
   const profilePath = path.join(memoryDir, "user-profile.md");
   await fs.writeFile(profilePath, profileMd, "utf-8");
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] profile written to ${profilePath} (${profileMd.length} chars) for userId=${userId}`);
-
-  // Write BOOTSTRAP.md to the workspace root (agents.defaults.workspace = authDir).
-  // OpenClaw reads it automatically on every main-agent run and injects it into the
-  // "# Project Context" section of the system prompt — no plugin hook required.
-  const bootstrapPath = path.join(authDir, "BOOTSTRAP.md");
-  const bootstrapContent = `### What you know about this person\n\n${profileMd}`;
-  await fs.writeFile(bootstrapPath, bootstrapContent, "utf-8");
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] BOOTSTRAP.md written to ${bootstrapPath} for userId=${userId}`);
-
-  // Persist to DB as backup
+  await refreshBootstrapFromArtifacts(authDir, { profileMdOverride: profileMd });
   await store.upsertProfileMd(userId, profileMd);
-  // eslint-disable-next-line no-console
-  console.log(`[synthesizer] profile synthesis complete for userId=${userId}`);
-};
 
-// ---------------------------------------------------------------------------
-// Incremental update — called when the agent sends an agent_note event
-// or when a batch of new messages accumulates
-// ---------------------------------------------------------------------------
+  // eslint-disable-next-line no-console
+  console.log(`[profile-projection] completed userId=${userId} profileLen=${profileMd.length}`);
+};
 
 export const appendAgentNoteToProfile = async (
   authDir: string,
@@ -418,22 +175,20 @@ export const appendAgentNoteToProfile = async (
   try {
     existing = await fs.readFile(profilePath, "utf-8");
   } catch {
-    // Profile may not exist yet
+    existing = "## Identity\n- Name: Unknown\n\n## Notes\n";
   }
 
   const timestamp = new Date().toISOString().slice(0, 10);
-  const noteSection = `\n\n## Agent Notes\n- [${timestamp}] ${note.trim()}`;
+  const cleanNote = normalizeLine(note);
+  if (!cleanNote) {
+    return;
+  }
 
-  // If there's already an "Agent Notes" section, append to it; otherwise add the section
   const next = existing.includes("## Agent Notes")
-    ? existing + `\n- [${timestamp}] ${note.trim()}`
-    : existing + noteSection;
+    ? `${existing}\n- [${timestamp}] ${cleanNote}`
+    : `${existing}\n\n## Agent Notes\n- [${timestamp}] ${cleanNote}`;
 
   await fs.mkdir(path.join(authDir, "memory"), { recursive: true });
   await fs.writeFile(profilePath, next, "utf-8");
-
-  // Keep BOOTSTRAP.md in sync so the agent sees the updated profile on the next run.
-  const bootstrapPath = path.join(authDir, "BOOTSTRAP.md");
-  const bootstrapContent = `### What you know about this person\n\n${next}`;
-  await fs.writeFile(bootstrapPath, bootstrapContent, "utf-8");
+  await refreshBootstrapFromArtifacts(authDir, { profileMdOverride: next });
 };

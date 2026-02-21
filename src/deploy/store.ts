@@ -5,8 +5,11 @@ import type {
   AgentRecord,
   AgentSettings,
   GatewayInstanceRecord,
+  GatewayRuntimeFingerprint,
   LoginSession,
   ProfileDataRecord,
+  ProfileMessageEventInput,
+  ProfileMessageEventRecord,
   RawProfileData,
   SessionErrorCode,
   SessionState,
@@ -40,17 +43,36 @@ export interface DeployStore {
   createGatewayInstanceForUser(
     userId: string,
     authDir: string,
-    extra?: { gatewayToken?: string; containerName?: string },
+    extra?: {
+      gatewayToken?: string;
+      containerName?: string;
+      runtime?: GatewayRuntimeFingerprint;
+      reconciledAt?: Date | null;
+    },
   ): Promise<GatewayInstanceRecord>;
   updateGatewayInstanceStatus(
     id: string,
     status: GatewayInstanceRecord["status"],
     containerId?: string | null,
+    extra?: {
+      runtime?: GatewayRuntimeFingerprint;
+      reconciledAt?: Date | null;
+    },
   ): Promise<GatewayInstanceRecord | null>;
   deleteExpiredLoginSessions(before: Date): Promise<number>;
   upsertRawProfileData(userId: string, data: RawProfileData): Promise<void>;
   getProfileData(userId: string): Promise<ProfileDataRecord | null>;
   upsertProfileMd(userId: string, profileMd: string): Promise<void>;
+  appendProfileMessageEvent(event: ProfileMessageEventInput): Promise<ProfileMessageEventRecord>;
+  listProfileMessageEvents(params: {
+    userId: string;
+    channel?: string;
+    peerId?: string;
+    direction?: "inbound" | "outbound";
+    from?: Date;
+    to?: Date;
+    limit?: number;
+  }): Promise<ProfileMessageEventRecord[]>;
 }
 
 export const createStore = (pool: Pool | null): DeployStore => {

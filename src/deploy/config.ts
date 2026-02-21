@@ -44,6 +44,17 @@ export const deployConfig = {
   adminToken: process.env.OPENCLAW_DEPLOY_ADMIN_TOKEN ?? "",
   reaperIntervalMs: parseNumber(process.env.OPENCLAW_DEPLOY_REAPER_INTERVAL_MS, 10 * 60 * 1000),
   reaperMaxAgeMs: parseNumber(process.env.OPENCLAW_DEPLOY_REAPER_TTL_MS, 6 * 60 * 60 * 1000),
+  // Reconcile existing users against desired gateway runtime/config/plugin versions.
+  gatewayReconcileIntervalMs: parseNumber(
+    process.env.OPENCLAW_DEPLOY_GATEWAY_RECONCILE_INTERVAL_MS,
+    10 * 60 * 1000,
+  ),
+  // Periodic projection sweep cadence: rebuild profile projections and summarize
+  // conversations for users with newly ingested message events.
+  profileProjectionIntervalMs: parseNumber(
+    process.env.OPENCLAW_DEPLOY_PROFILE_PROJECTION_INTERVAL_MS,
+    60 * 60 * 1000,
+  ),
   // URL that gateway containers use to call back to this deploy server.
   // Must be reachable from inside the Docker network (e.g. http://deploy:8080).
   internalUrl: process.env.OPENCLAW_DEPLOY_INTERNAL_URL ?? "http://deploy:8080",

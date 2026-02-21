@@ -3,8 +3,11 @@ import type {
   AgentRecord,
   AgentSettings,
   GatewayInstanceRecord,
+  GatewayRuntimeFingerprint,
   LoginSession,
   ProfileDataRecord,
+  ProfileMessageEventInput,
+  ProfileMessageEventRecord,
   RawProfileData,
   UserRecord,
 } from "./types.js";
@@ -17,6 +20,7 @@ export class MemoryStore implements DeployStore {
   private agents = new Map<string, AgentRecord>();
   private gateways = new Map<string, GatewayInstanceRecord>();
   private profileData = new Map<string, ProfileDataRecord>();
+  private profileMessageEvents = new Map<string, ProfileMessageEventRecord[]>();
 
   async createLoginSession(session: LoginSession): Promise<LoginSession> {
     this.sessions.set(session.id, session);
@@ -137,7 +141,12 @@ export class MemoryStore implements DeployStore {
   async createGatewayInstanceForUser(
     userId: string,
     authDir: string,
-    extra?: { gatewayToken?: string; containerName?: string },
+    extra?: {
+      gatewayToken?: string;
+      containerName?: string;
+      runtime?: GatewayRuntimeFingerprint;
+      reconciledAt?: Date | null;
+    },
   ): Promise<GatewayInstanceRecord> {
     const now = new Date();
     const existing = await this.getGatewayInstanceByUserId(userId);
@@ -149,6 +158,11 @@ export class MemoryStore implements DeployStore {
         containerId: null,
         gatewayToken: extra?.gatewayToken ?? existing.gatewayToken,
         containerName: extra?.containerName ?? existing.containerName,
+        configVersion: extra?.runtime?.configVersion ?? existing.configVersion,
+        pluginVersion: extra?.runtime?.pluginVersion ?? existing.pluginVersion,
+        runtimePolicyVersion: extra?.runtime?.runtimePolicyVersion ?? existing.runtimePolicyVersion,
+        imageRef: extra?.runtime?.imageRef ?? existing.imageRef,
+        reconciledAt: extra?.reconciledAt ?? existing.reconciledAt,
         createdAt: now,
       };
       this.gateways.set(existing.id, updated);
@@ -162,6 +176,11 @@ export class MemoryStore implements DeployStore {
       status: "provisioning",
       authDirPath: authDir,
       gatewayToken: extra?.gatewayToken ?? "",
+      configVersion: extra?.runtime?.configVersion ?? "",
+      pluginVersion: extra?.runtime?.pluginVersion ?? "",
+      runtimePolicyVersion: extra?.runtime?.runtimePolicyVersion ?? "",
+      imageRef: extra?.runtime?.imageRef ?? "",
+      reconciledAt: extra?.reconciledAt ?? null,
       createdAt: now,
     };
     this.gateways.set(instance.id, instance);
@@ -217,10 +236,83 @@ export class MemoryStore implements DeployStore {
     });
   }
 
+  async appendProfileMessageEvent(event: ProfileMessageEventInput): Promise<ProfileMessageEventRecord> {
+    const now = new Date();
+    const row: ProfileMessageEventRecord = {
+      id: `pme_${randomUUID()}`,
+      userId: event.userId,
+      channel: event.channel.trim() || "whatsapp",
+      peerId: event.peerId.trim(),
+      direction: event.direction,
+      content: event.content,
+      metadataJson: event.metadataJson ?? null,
+      occurredAt: event.occurredAt ?? now,
+      createdAt: now,
+    };
+    const existing = this.profileMessageEvents.get(event.userId) ?? [];
+    existing.push(row);
+    // Keep in-memory store bounded to avoid unbounded growth in dev/no-db mode.
+    const MAX_PER_USER = 10_000;
+    if (existing.length > MAX_PER_USER) {
+      existing.splice(0, existing.length - MAX_PER_USER);
+    }
+    this.profileMessageEvents.set(event.userId, existing);
+    return row;
+  }
+
+  async listProfileMessageEvents(params: {
+    userId: string;
+    channel?: string;
+    peerId?: string;
+    direction?: "inbound" | "outbound";
+    from?: Date;
+    to?: Date;
+    limit?: number;
+  }): Promise<ProfileMessageEventRecord[]> {
+    const list = [...(this.profileMessageEvents.get(params.userId) ?? [])];
+    const filtered = list.filter((row) => {
+      if (params.channel && row.channel !== params.channel) {
+        return false;
+      }
+      if (params.peerId && row.peerId !== params.peerId) {
+        return false;
+      }
+      if (params.direction && row.direction !== params.direction) {
+        return false;
+      }
+      if (params.from && row.occurredAt < params.from) {
+        return false;
+      }
+      if (params.to && row.occurredAt > params.to) {
+        return false;
+      }
+      return true;
+    });
+    filtered.sort((a, b) => {
+      const byOccurredAt = a.occurredAt.getTime() - b.occurredAt.getTime();
+      if (byOccurredAt !== 0) {
+        return byOccurredAt;
+      }
+      const byCreatedAt = a.createdAt.getTime() - b.createdAt.getTime();
+      if (byCreatedAt !== 0) {
+        return byCreatedAt;
+      }
+      return a.id.localeCompare(b.id);
+    });
+    if (params.limit && params.limit > 0 && filtered.length > params.limit) {
+      return filtered.slice(filtered.length - params.limit);
+    }
+    return filtered;
+  }
+
   async updateGatewayInstanceStatus(
     id: string,
     status: GatewayInstanceRecord["status"],
     containerId?: string | null,
+    extra?: {
+      runtime?: GatewayRuntimeFingerprint;
+      reconciledAt?: Date | null;
+    },
   ): Promise<GatewayInstanceRecord | null> {
     const existing = this.gateways.get(id);
     if (!existing) {
@@ -230,6 +322,14 @@ export class MemoryStore implements DeployStore {
       ...existing,
       status,
       containerId: containerId === undefined ? existing.containerId : containerId,
+      configVersion: extra?.runtime?.configVersion ?? existing.configVersion,
+      pluginVersion: extra?.runtime?.pluginVersion ?? existing.pluginVersion,
+      runtimePolicyVersion: extra?.runtime?.runtimePolicyVersion ?? existing.runtimePolicyVersion,
+      imageRef: extra?.runtime?.imageRef ?? existing.imageRef,
+      reconciledAt:
+        extra?.reconciledAt === undefined
+          ? existing.reconciledAt
+          : extra.reconciledAt,
     };
     this.gateways.set(id, next);
     return next;

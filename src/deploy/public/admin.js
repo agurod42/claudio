@@ -93,7 +93,7 @@ const inlineMarkdown = (text) =>
 
 const renderProfileTab = (data) => {
   if (!data?.profileMd) {
-    return '<p class="profile-empty">No profile synthesised yet. Complete a fresh QR login to generate one.</p>';
+    return '<p class="profile-empty">No projected profile yet. Complete a fresh QR login to generate one.</p>';
   }
   return renderMarkdown(data.profileMd);
 };
@@ -183,9 +183,9 @@ const openProfileModal = (userId) => {
       profileModalData = data;
       const activeTab = profileModal.body?.dataset.activeTab ?? "profile";
       profileModal.meta.textContent = data.updatedAt
-        ? `Synthesised ${formatDate(data.updatedAt)}`
+        ? `Projected ${formatDate(data.updatedAt)}`
         : data.rawData?.capturedAt
-          ? `Captured ${formatDate(data.rawData.capturedAt)} · not yet synthesised`
+          ? `Captured ${formatDate(data.rawData.capturedAt)} · not yet projected`
           : "No data yet";
       switchProfileTab(activeTab);
     })
@@ -209,7 +209,7 @@ if (profileModal.resynthesize) {
     if (!userId) return;
     const btn = profileModal.resynthesize;
     const original = btn.textContent;
-    btn.textContent = "Resynthesizing…";
+    btn.textContent = "Rebuilding…";
     btn.disabled = true;
     try {
       const r = await fetch(`/v1/admin/users/${encodeURIComponent(userId)}/resynthesize`, {
@@ -220,7 +220,7 @@ if (profileModal.resynthesize) {
       // Reload the profile data and re-render
       openProfileModal(userId);
     } catch (err) {
-      alert(`Resynthesize failed: ${err.message}`);
+      alert(`Profile rebuild failed: ${err.message}`);
       btn.textContent = original;
       btn.disabled = false;
     }
@@ -652,7 +652,7 @@ const runResetWaSession = async (userId) => {
   const user = state.users.find((entry) => entry.userId === userId);
   const userLabel = user?.whatsappId || userId;
   const confirmed = window.confirm(
-    `Reset WhatsApp session for ${userLabel}?\n\nThis will:\n• Stop the gateway\n• Delete the WA credentials\n• Require a fresh QR code scan to reconnect\n\nThe next login will capture full contact/chat history for profile synthesis.`,
+    `Reset WhatsApp session for ${userLabel}?\n\nThis will:\n• Stop the gateway\n• Delete the WA credentials\n• Require a fresh QR code scan to reconnect\n\nThe next login will capture full contact/chat history for profile projection.`,
   );
   if (!confirmed) {
     return;

@@ -63,7 +63,19 @@ export type GatewayInstanceRecord = {
   status: "provisioning" | "running" | "stopped" | "error";
   authDirPath: string;
   gatewayToken: string;
+  configVersion: string;
+  pluginVersion: string;
+  runtimePolicyVersion: string;
+  imageRef: string;
+  reconciledAt: Date | null;
   createdAt: Date;
+};
+
+export type GatewayRuntimeFingerprint = {
+  configVersion: string;
+  pluginVersion: string;
+  runtimePolicyVersion: string;
+  imageRef: string;
 };
 
 export type RawProfileData = {
@@ -82,4 +94,28 @@ export type ProfileDataRecord = {
   profileMd: string | null;
   profileUpdatedAt: Date | null;
   rawUpdatedAt: Date;
+};
+
+export type ProfileMessageDirection = "inbound" | "outbound";
+
+export type ProfileMessageEventInput = {
+  userId: string;
+  channel: string;
+  peerId: string;
+  direction: ProfileMessageDirection;
+  content: string;
+  occurredAt?: Date;
+  metadataJson?: string | null;
+};
+
+export type ProfileMessageEventRecord = {
+  id: string;
+  userId: string;
+  channel: string;
+  peerId: string;
+  direction: ProfileMessageDirection;
+  content: string;
+  metadataJson: string | null;
+  occurredAt: Date;
+  createdAt: Date;
 };

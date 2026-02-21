@@ -65,7 +65,7 @@ export const runLoginWorker = async (
 
   // Accumulate WhatsApp sync data emitted by Baileys during session establishment.
   // These events fire during the connection hold window and give us rich context
-  // about the user (contacts, chats, recent messages) for profile synthesis.
+  // about the user (contacts, chats, recent messages) for deterministic projection.
   let capturedUserId: string | null = null;
   const syncData = {
     displayName: null as string | null,

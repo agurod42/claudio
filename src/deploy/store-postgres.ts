@@ -4,8 +4,11 @@ import type {
   AgentRecord,
   AgentSettings,
   GatewayInstanceRecord,
+  GatewayRuntimeFingerprint,
   LoginSession,
   ProfileDataRecord,
+  ProfileMessageEventInput,
+  ProfileMessageEventRecord,
   RawProfileData,
   SessionErrorCode,
   UserRecord,
@@ -77,6 +80,23 @@ const mapGateway = (row: QueryResultRow): GatewayInstanceRecord => ({
   status: row.status,
   authDirPath: String(row.auth_dir_path),
   gatewayToken: row.gateway_token ? String(row.gateway_token) : "",
+  configVersion: row.config_version ? String(row.config_version) : "",
+  pluginVersion: row.plugin_version ? String(row.plugin_version) : "",
+  runtimePolicyVersion: row.runtime_policy_version ? String(row.runtime_policy_version) : "",
+  imageRef: row.image_ref ? String(row.image_ref) : "",
+  reconciledAt: row.reconciled_at ? parseDate(row.reconciled_at) : null,
+  createdAt: parseDate(row.created_at),
+});
+
+const mapProfileMessageEvent = (row: QueryResultRow): ProfileMessageEventRecord => ({
+  id: String(row.id),
+  userId: String(row.user_id),
+  channel: String(row.channel),
+  peerId: String(row.peer_id),
+  direction: row.direction === "outbound" ? "outbound" : "inbound",
+  content: String(row.content ?? ""),
+  metadataJson: row.metadata_json ? String(row.metadata_json) : null,
+  occurredAt: parseDate(row.occurred_at),
   createdAt: parseDate(row.created_at),
 });
 
@@ -270,23 +290,59 @@ export class PostgresStore implements DeployStore {
   async createGatewayInstanceForUser(
     userId: string,
     authDir: string,
-    extra?: { gatewayToken?: string; containerName?: string },
+    extra?: {
+      gatewayToken?: string;
+      containerName?: string;
+      runtime?: GatewayRuntimeFingerprint;
+      reconciledAt?: Date | null;
+    },
   ): Promise<GatewayInstanceRecord> {
     const id = `gw_${randomUUID()}`;
     const result = await this.pool.query(
       `insert into gateway_instances
-      (id, user_id, container_id, status, auth_dir_path, gateway_token, container_name)
-      values ($1,$2,$3,$4,$5,$6,$7)
+      (
+        id,
+        user_id,
+        container_id,
+        status,
+        auth_dir_path,
+        gateway_token,
+        container_name,
+        config_version,
+        plugin_version,
+        runtime_policy_version,
+        image_ref,
+        reconciled_at
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       on conflict (user_id)
       do update set
         status = excluded.status,
         auth_dir_path = excluded.auth_dir_path,
         gateway_token = coalesce(excluded.gateway_token, gateway_instances.gateway_token),
         container_name = coalesce(excluded.container_name, gateway_instances.container_name),
+        config_version = coalesce(excluded.config_version, gateway_instances.config_version),
+        plugin_version = coalesce(excluded.plugin_version, gateway_instances.plugin_version),
+        runtime_policy_version = coalesce(excluded.runtime_policy_version, gateway_instances.runtime_policy_version),
+        image_ref = coalesce(excluded.image_ref, gateway_instances.image_ref),
+        reconciled_at = coalesce(excluded.reconciled_at, gateway_instances.reconciled_at),
         container_id = null,
         created_at = now()
       returning *`,
-      [id, userId, null, "provisioning", authDir, extra?.gatewayToken ?? null, extra?.containerName ?? null],
+      [
+        id,
+        userId,
+        null,
+        "provisioning",
+        authDir,
+        extra?.gatewayToken ?? null,
+        extra?.containerName ?? null,
+        extra?.runtime?.configVersion ?? "",
+        extra?.runtime?.pluginVersion ?? "",
+        extra?.runtime?.runtimePolicyVersion ?? "",
+        extra?.runtime?.imageRef ?? "",
+        extra?.reconciledAt ?? null,
+      ],
     );
     return mapGateway(result.rows[0]);
   }
@@ -295,6 +351,10 @@ export class PostgresStore implements DeployStore {
     id: string,
     status: GatewayInstanceRecord["status"],
     containerId?: string | null,
+    extra?: {
+      runtime?: GatewayRuntimeFingerprint;
+      reconciledAt?: Date | null;
+    },
   ): Promise<GatewayInstanceRecord | null> {
     const fields = ["status = $1"];
     const values: unknown[] = [status];
@@ -302,6 +362,26 @@ export class PostgresStore implements DeployStore {
     if (containerId !== undefined) {
       fields.push(`container_id = $${idx++}`);
       values.push(containerId);
+    }
+    if (extra?.runtime?.configVersion !== undefined) {
+      fields.push(`config_version = $${idx++}`);
+      values.push(extra.runtime.configVersion);
+    }
+    if (extra?.runtime?.pluginVersion !== undefined) {
+      fields.push(`plugin_version = $${idx++}`);
+      values.push(extra.runtime.pluginVersion);
+    }
+    if (extra?.runtime?.runtimePolicyVersion !== undefined) {
+      fields.push(`runtime_policy_version = $${idx++}`);
+      values.push(extra.runtime.runtimePolicyVersion);
+    }
+    if (extra?.runtime?.imageRef !== undefined) {
+      fields.push(`image_ref = $${idx++}`);
+      values.push(extra.runtime.imageRef);
+    }
+    if (extra?.reconciledAt !== undefined) {
+      fields.push(`reconciled_at = $${idx++}`);
+      values.push(extra.reconciledAt);
     }
     values.push(id);
     const result = await this.pool.query(
@@ -377,5 +457,72 @@ export class PostgresStore implements DeployStore {
         profile_updated_at = now()`,
       [id, userId, profileMd],
     );
+  }
+
+  async appendProfileMessageEvent(event: ProfileMessageEventInput): Promise<ProfileMessageEventRecord> {
+    const id = `pme_${randomUUID()}`;
+    const result = await this.pool.query(
+      `insert into user_profile_message_events
+      (id, user_id, channel, peer_id, direction, content, metadata_json, occurred_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8)
+      returning *`,
+      [
+        id,
+        event.userId,
+        event.channel.trim() || "whatsapp",
+        event.peerId.trim(),
+        event.direction,
+        event.content,
+        event.metadataJson ?? null,
+        event.occurredAt ?? new Date(),
+      ],
+    );
+    return mapProfileMessageEvent(result.rows[0]);
+  }
+
+  async listProfileMessageEvents(params: {
+    userId: string;
+    channel?: string;
+    peerId?: string;
+    direction?: "inbound" | "outbound";
+    from?: Date;
+    to?: Date;
+    limit?: number;
+  }): Promise<ProfileMessageEventRecord[]> {
+    const where: string[] = ["user_id = $1"];
+    const values: unknown[] = [params.userId];
+    let idx = 2;
+
+    if (params.channel) {
+      where.push(`channel = $${idx++}`);
+      values.push(params.channel);
+    }
+    if (params.peerId) {
+      where.push(`peer_id = $${idx++}`);
+      values.push(params.peerId);
+    }
+    if (params.direction) {
+      where.push(`direction = $${idx++}`);
+      values.push(params.direction);
+    }
+    if (params.from) {
+      where.push(`occurred_at >= $${idx++}`);
+      values.push(params.from);
+    }
+    if (params.to) {
+      where.push(`occurred_at <= $${idx++}`);
+      values.push(params.to);
+    }
+    const limit = params.limit && params.limit > 0 ? Math.floor(params.limit) : 200;
+    values.push(limit);
+    const query = `select * from (
+      select * from user_profile_message_events
+      where ${where.join(" and ")}
+      order by occurred_at desc, created_at desc, id desc
+      limit $${idx}
+    ) as recent
+    order by occurred_at asc, created_at asc, id asc`;
+    const result = await this.pool.query(query, values);
+    return result.rows.map(mapProfileMessageEvent);
   }
 }

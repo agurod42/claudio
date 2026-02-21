@@ -4,8 +4,25 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { deployConfig } from "./config.js";
 import type { DeployStore } from "./store.js";
-import type { GatewayInstanceRecord, ModelTier } from "./types.js";
+import type { GatewayInstanceRecord, GatewayRuntimeFingerprint, ModelTier } from "./types.js";
 import type { ProvisionOptions, ProvisionResult, Provisioner } from "./provisioner.js";
+import {
+  DEFAULT_BROWSER_DEFAULT_PROFILE,
+  DEFAULT_BROWSER_ENABLED,
+  DEFAULT_BROWSER_HEADLESS,
+  DEFAULT_BROWSER_NO_SANDBOX,
+  DEFAULT_GATEWAY_ROOT_DIR,
+  DEFAULT_GATEWAY_WHATSAPP_AUTH_DIR,
+  DEFAULT_TOOLS_ALSO_ALLOW,
+  DEFAULT_TOOLS_PROFILE,
+  GATEWAY_CONFIG_VERSION,
+  GATEWAY_PLUGIN_VERSION,
+  GATEWAY_RUNTIME_POLICY_VERSION,
+  resolveContextTokensForTier,
+  resolveModelFallbacksForTier,
+  resolvePrimaryModelForTier,
+} from "./gateway-policy.js";
+import { buildWhatsAppDirectoryPeers, type WhatsAppDirectoryPeer } from "./whatsapp-directory.js";
 
 const CONFIG_FILENAME = "openclaw.json";
 const PLUGIN_FILENAME = "clawdly-profile.js";
@@ -30,56 +47,6 @@ const GATEWAY_ENV_PASSTHROUGH = [
   "CEREBRAS_API_KEY",
   "NVIDIA_API_KEY",
 ] as const;
-
-const DEFAULT_TOOLS_PROFILE = "minimal";
-
-// ---------------------------------------------------------------------------
-// Model strategy (all free options prioritised first)
-//
-// best/premium: Kimi K2.5 (free 671B coding champion) → Gemini Pro (free 1M ctx)
-//               → Gemini Flash (free, fast) → Nemotron Ultra (free 253B)
-//               → Groq 70B (free*) → GPT-4o-mini (cheap last resort)
-//
-// fast:         Gemini Flash (free, fast, smart 1M ctx) → Groq 8B (free*, ultra-fast)
-//               → Nemotron Nano (free) → GPT-4o-mini (cheap last resort)
-//
-// NOTE: Groq is not a native LLM provider in OpenClaw — it is configured as a
-// custom openai-completions provider below so the model IDs resolve correctly.
-// ---------------------------------------------------------------------------
-
-const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
-  best: "nvidia/moonshotai/kimi-k2.5",
-  fast: "google/gemini-3-flash-preview",
-  premium: "nvidia/moonshotai/kimi-k2.5",
-};
-
-const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
-  best: [
-    "google/gemini-3-pro-preview",
-    "google/gemini-3-flash-preview",
-    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "groq/llama-3.3-70b-versatile",
-    "openai/gpt-4o-mini",
-  ],
-  fast: [
-    "groq/llama-3.1-8b-instant",
-    "nvidia/nvidia/llama-3.1-nemotron-nano-8b-v1",
-    "openai/gpt-4o-mini",
-  ],
-  premium: [
-    "google/gemini-3-pro-preview",
-    "google/gemini-3-flash-preview",
-    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "groq/llama-3.3-70b-versatile",
-    "openai/gpt-4o-mini",
-  ],
-};
-
-const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
-  best: 131_072,
-  fast: 32_000,
-  premium: 131_072,
-};
 
 const normalizeOrigin = (value: string | null | undefined) => {
   const trimmed = value?.trim();
@@ -110,20 +77,13 @@ const resolveControlUiAllowedOrigins = () => {
   return Array.from(unique);
 };
 
-const resolvePrimaryModel = (modelTier: ModelTier | undefined) =>
-  MODEL_PRIMARY_BY_TIER[modelTier ?? "best"] ?? MODEL_PRIMARY_BY_TIER.best;
-
-const resolveModelFallbacks = (modelTier: ModelTier | undefined) =>
-  [...(MODEL_FALLBACKS_BY_TIER[modelTier ?? "best"] ?? MODEL_FALLBACKS_BY_TIER.best)];
-
-const resolveContextTokens = (modelTier: ModelTier | undefined) =>
-  MODEL_CONTEXT_TOKENS_BY_TIER[modelTier ?? "best"] ?? MODEL_CONTEXT_TOKENS_BY_TIER.best;
-
 const buildConfig = (
-  authDir: string,
+  gatewayRootDir: string,
+  whatsappAuthDir: string,
   whatsappId: string,
   gatewayToken: string,
   modelTier?: ModelTier,
+  directoryPeers: WhatsAppDirectoryPeer[] = [],
 ) => ({
   gateway: {
     auth: {
@@ -140,16 +100,17 @@ const buildConfig = (
       dmPolicy: "allowlist",
       allowFrom: [whatsappId],
       selfChatMode: true,
+      ...(directoryPeers.length > 0 ? { directoryPeers } : {}),
       accounts: {
         default: {
-          authDir,
+          authDir: whatsappAuthDir,
         },
       },
     },
   },
   plugins: {
     load: {
-      paths: [authDir],
+      paths: [gatewayRootDir],
     },
     entries: {
       whatsapp: {
@@ -159,6 +120,12 @@ const buildConfig = (
         enabled: true,
       },
     },
+  },
+  browser: {
+    enabled: DEFAULT_BROWSER_ENABLED,
+    defaultProfile: DEFAULT_BROWSER_DEFAULT_PROFILE,
+    headless: DEFAULT_BROWSER_HEADLESS,
+    noSandbox: DEFAULT_BROWSER_NO_SANDBOX,
   },
   models: {
     mode: "merge",
@@ -219,20 +186,20 @@ const buildConfig = (
   },
   agents: {
     defaults: {
-      // Point the workspace at the auth dir so OpenClaw reads BOOTSTRAP.md from
+      // Point the workspace at the gateway root so OpenClaw reads BOOTSTRAP.md from
       // there automatically on every main-agent run (sub-agents are excluded by
       // OpenClaw's SUBAGENT_BOOTSTRAP_ALLOWLIST — only AGENTS.md and TOOLS.md).
-      workspace: authDir,
-      contextTokens: resolveContextTokens(modelTier),
+      workspace: gatewayRootDir,
+      contextTokens: resolveContextTokensForTier(modelTier),
       model: {
-        primary: resolvePrimaryModel(modelTier),
-        fallbacks: resolveModelFallbacks(modelTier),
+        primary: resolvePrimaryModelForTier(modelTier),
+        fallbacks: resolveModelFallbacksForTier(modelTier),
       },
     },
   },
   tools: {
     profile: DEFAULT_TOOLS_PROFILE,
-    alsoAllow: ["get_user_profile", "update_user_profile", "memory_search", "memory_get"],
+    alsoAllow: DEFAULT_TOOLS_ALSO_ALLOW,
   },
 });
 
@@ -262,12 +229,8 @@ export default function register(api) {
   // (agents.defaults.workspace = /data/auth). OpenClaw reads it automatically
   // on every main-agent run — no hook needed here.
 
-  // Forward each inbound message to the deploy server for profile enrichment.
-  // event shape: { from: string, content: string, timestamp?: number }
-  api.on("message_received", async (event) => {
+  const forwardMessageEvent = async (payload) => {
     if (!CLAWDLY_USER_ID || !CLAWDLY_DEPLOY_URL) return;
-    const content = typeof event?.content === "string" ? event.content : "";
-    console.log("[clawdly-profile] message_received: forwarding event contentLen=" + content.length);
     try {
       const resp = await fetch(
         \`\${CLAWDLY_DEPLOY_URL}/v1/internal/profile-events/\${encodeURIComponent(CLAWDLY_USER_ID)}\`,
@@ -277,21 +240,69 @@ export default function register(api) {
             "Content-Type": "application/json",
             Authorization: \`Bearer \${CLAWDLY_GATEWAY_TOKEN}\`,
           },
-          body: JSON.stringify({
-            type: "message",
-            content: content.slice(0, 4000),
-            direction: "inbound",
-            timestamp: new Date().toISOString(),
-          }),
+          body: JSON.stringify(payload),
         },
       );
       if (!resp.ok) {
-        console.warn("[clawdly-profile] message_received: deploy server returned " + resp.status);
+        console.warn("[clawdly-profile] message event: deploy server returned " + resp.status);
       }
     } catch (err) {
-      console.warn("[clawdly-profile] message_received: fetch failed: " + String(err));
+      console.warn("[clawdly-profile] message event: fetch failed: " + String(err));
       // Non-critical — never block the agent turn.
     }
+  };
+
+  const toIsoTimestamp = (value) => {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const asMs = value > 10_000_000_000 ? value : value * 1000;
+      const parsed = new Date(asMs);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toISOString();
+      }
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = new Date(value.trim());
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toISOString();
+      }
+    }
+    return new Date().toISOString();
+  };
+
+  // Forward each inbound message to the deploy server for profile enrichment.
+  // event shape: { from: string, content: string, timestamp?: number }
+  api.on("message_received", async (event, ctx) => {
+    const content = typeof event?.content === "string" ? event.content : "";
+    const from = typeof event?.from === "string" ? event.from : "";
+    const channelId = typeof ctx?.channelId === "string" ? ctx.channelId : "whatsapp";
+    if (!content.trim() || !from.trim()) return;
+    console.log("[clawdly-profile] message_received: forwarding event contentLen=" + content.length);
+    await forwardMessageEvent({
+      type: "message",
+      channel: channelId,
+      peerId: from.trim(),
+      content: content.slice(0, 4000),
+      direction: "inbound",
+      timestamp: toIsoTimestamp(event?.timestamp),
+    });
+  });
+
+  // Forward outbound messages too, so profile/memory stays synchronized with what the
+  // assistant actually sent.
+  api.on("message_sent", async (event, ctx) => {
+    if (!event?.success) return;
+    const content = typeof event?.content === "string" ? event.content : "";
+    const to = typeof event?.to === "string" ? event.to : "";
+    const channelId = typeof ctx?.channelId === "string" ? ctx.channelId : "whatsapp";
+    if (!content.trim() || !to.trim()) return;
+    await forwardMessageEvent({
+      type: "message",
+      channel: channelId,
+      peerId: to.trim(),
+      content: content.slice(0, 4000),
+      direction: "outbound",
+      timestamp: toIsoTimestamp(event?.timestamp),
+    });
   });
 
   // Tool: retrieve the current profile.
@@ -435,16 +446,27 @@ export class DockerProvisioner implements Provisioner {
   ): Promise<ProvisionResult> {
     const containerName = this.resolveContainerName(userId);
     const gatewayToken = randomBytes(24).toString("hex");
+    const runtime = await this.getRuntimeFingerprint();
 
     // 1. Upsert DB record
     const instance = await this.store.createGatewayInstanceForUser(userId, authDir, {
       gatewayToken,
       containerName,
+      runtime,
     });
 
     // 2. Write openclaw.json config + plugin file
-    const gatewayAuthDir = this.resolveGatewayAuthDir(userId);
-    await this.writeConfigFile(authDir, gatewayAuthDir, whatsappId, gatewayToken, userId, options?.modelTier);
+    const gatewayRootDir = this.resolveGatewayRootDir(userId);
+    const gatewayWhatsappAuthDir = this.resolveGatewayAuthDir(userId);
+    await this.writeConfigFile(
+      authDir,
+      gatewayRootDir,
+      gatewayWhatsappAuthDir,
+      whatsappId,
+      gatewayToken,
+      userId,
+      options?.modelTier,
+    );
     await this.ensureAuthOwnership(authDir);
 
     // 3. Remove any stale container with this name (idempotent)
@@ -490,7 +512,10 @@ export class DockerProvisioner implements Provisioner {
     // 5. Health check – wait for container to stay running
     const healthy = await this.waitForHealthy(container.id);
     const finalStatus = healthy ? "running" : "error";
-    const updated = await this.store.updateGatewayInstanceStatus(instance.id, finalStatus, container.id);
+    const updated = await this.store.updateGatewayInstanceStatus(instance.id, finalStatus, container.id, {
+      runtime,
+      reconciledAt: new Date(),
+    });
 
     return { instance: updated ?? instance, healthy };
   }
@@ -558,6 +583,16 @@ export class DockerProvisioner implements Provisioner {
     } catch {
       return false;
     }
+  }
+
+  async getRuntimeFingerprint(): Promise<GatewayRuntimeFingerprint> {
+    const imageRef = await this.resolveImageRef();
+    return {
+      configVersion: GATEWAY_CONFIG_VERSION,
+      pluginVersion: GATEWAY_PLUGIN_VERSION,
+      runtimePolicyVersion: GATEWAY_RUNTIME_POLICY_VERSION,
+      imageRef,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -636,9 +671,14 @@ export class DockerProvisioner implements Provisioner {
     return `${this.opts.containerPrefix}${userId}`;
   }
 
+  private resolveGatewayRootDir(_userId: string) {
+    return DEFAULT_GATEWAY_ROOT_DIR;
+  }
+
   private resolveGatewayAuthDir(_userId: string) {
-    // With per-user subpath mount, the user's dir is mounted directly at /data/auth
-    return "/data/auth";
+    // Per-user credentials are persisted in /data/auth/wa-session-data.
+    // Point WhatsApp account authDir there so gateway sessions survive restarts.
+    return DEFAULT_GATEWAY_WHATSAPP_AUTH_DIR;
   }
 
   private resolveGatewayConfigPath(_userId: string) {
@@ -667,21 +707,33 @@ export class DockerProvisioner implements Provisioner {
 
   private async writeConfigFile(
     hostAuthDir: string,
-    gatewayAuthDir: string,
+    gatewayRootDir: string,
+    gatewayWhatsappAuthDir: string,
     whatsappId: string,
     gatewayToken: string,
     userId: string,
     modelTier?: ModelTier,
   ) {
     await fs.mkdir(hostAuthDir, { recursive: true });
-    const config = buildConfig(gatewayAuthDir, whatsappId, gatewayToken, modelTier);
-    const primary = resolvePrimaryModel(modelTier);
-    const fallbacks = resolveModelFallbacks(modelTier);
+    const directoryPeers = buildWhatsAppDirectoryPeers(await this.store.getProfileData(userId), {
+      excludeIds: [whatsappId],
+    });
+    const config = buildConfig(
+      gatewayRootDir,
+      gatewayWhatsappAuthDir,
+      whatsappId,
+      gatewayToken,
+      modelTier,
+      directoryPeers,
+    );
+    const primary = resolvePrimaryModelForTier(modelTier);
+    const fallbacks = resolveModelFallbacksForTier(modelTier);
     // eslint-disable-next-line no-console
     console.log(
       `[provisioner] writing config for userId=${userId} tier=${modelTier ?? "best"} ` +
       `model.primary=${primary} model.fallbacks=[${fallbacks.join(", ")}] ` +
-      `contextTokens=${resolveContextTokens(modelTier)}`,
+      `contextTokens=${resolveContextTokensForTier(modelTier)} ` +
+      `directoryPeers=${directoryPeers.length}`,
     );
     const configPath = path.join(hostAuthDir, CONFIG_FILENAME);
     await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
@@ -769,5 +821,18 @@ export class DockerProvisioner implements Provisioner {
       }
     }
     return false;
+  }
+
+  private async resolveImageRef(): Promise<string> {
+    try {
+      const image = await this.docker.getImage(this.opts.image).inspect();
+      const imageId = typeof image?.Id === "string" ? image.Id.trim() : "";
+      if (imageId) {
+        return `${this.opts.image}@${imageId}`;
+      }
+      return this.opts.image;
+    } catch {
+      return this.opts.image;
+    }
   }
 }

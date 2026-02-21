@@ -19,9 +19,28 @@ import {
 } from "./store.js";
 import type { SessionEvent } from "./session-events.js";
 import { issueToken, verifyToken } from "./auth.js";
-import { appendAgentNoteToProfile, synthesizeUserProfile } from "./profile-synthesizer.js";
+import { appendAgentNoteToProfile, projectUserProfile } from "./profile-synthesizer.js";
 import { collectWhatsAppSyncData } from "./wa-session.js";
-import type { ModelTier } from "./types.js";
+import type { GatewayInstanceRecord, ModelTier } from "./types.js";
+import {
+  DEFAULT_BROWSER_DEFAULT_PROFILE,
+  DEFAULT_BROWSER_ENABLED,
+  DEFAULT_BROWSER_HEADLESS,
+  DEFAULT_BROWSER_NO_SANDBOX,
+  DEFAULT_GATEWAY_ROOT_DIR,
+  DEFAULT_GATEWAY_WHATSAPP_AUTH_DIR,
+  DEFAULT_TOOLS_ALSO_ALLOW,
+  DEFAULT_TOOLS_PROFILE,
+  resolveContextTokensForTier,
+  resolveModelFallbacksForTier,
+  resolvePrimaryModelForTier,
+} from "./gateway-policy.js";
+import { buildWhatsAppDirectoryPeers, type WhatsAppDirectoryPeer } from "./whatsapp-directory.js";
+import {
+  appendConversationLogEntry,
+  runConversationSummarySweep,
+  runIncrementalProfileUpdate,
+} from "./profile-live-updater.js";
 
 const toJson = (value: unknown) => JSON.stringify(value);
 
@@ -171,57 +190,63 @@ const resolveDefaultControlUiAllowedOrigins = () => {
   return Array.from(unique);
 };
 
-const DEFAULT_TOOLS_PROFILE = "minimal";
-
-// ---------------------------------------------------------------------------
-// Model strategy — MUST stay in sync with provisioner-docker.ts.
-// ensureGatewayAgentModelConfig() patches existing openclaw.json on every
-// /v1/agent GET and PATCH, so drift here silently overwrites the richer
-// fallback list that provisioner writes on initial provisioning.
-// ---------------------------------------------------------------------------
-
-const MODEL_PRIMARY_BY_TIER: Record<ModelTier, string> = {
-  best: "nvidia/moonshotai/kimi-k2.5",
-  fast: "google/gemini-3-flash-preview",
-  premium: "nvidia/moonshotai/kimi-k2.5",
+type NormalizedWhatsAppDirectoryPeer = {
+  id: string;
+  name?: string;
+  handle?: string;
+  accountId?: string;
 };
 
-const MODEL_FALLBACKS_BY_TIER: Record<ModelTier, string[]> = {
-  best: [
-    "google/gemini-3-pro-preview",
-    "google/gemini-3-flash-preview",
-    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "groq/llama-3.3-70b-versatile",
-    "openai/gpt-4o-mini",
-  ],
-  fast: [
-    "groq/llama-3.1-8b-instant",
-    "nvidia/nvidia/llama-3.1-nemotron-nano-8b-v1",
-    "openai/gpt-4o-mini",
-  ],
-  premium: [
-    "google/gemini-3-pro-preview",
-    "google/gemini-3-flash-preview",
-    "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "groq/llama-3.3-70b-versatile",
-    "openai/gpt-4o-mini",
-  ],
+const normalizeDirectoryPeerText = (value: unknown): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? normalized : null;
 };
 
-const MODEL_CONTEXT_TOKENS_BY_TIER: Record<ModelTier, number> = {
-  best: 131_072,
-  fast: 32_000,
-  premium: 131_072,
+const normalizeWhatsAppDirectoryPeerId = (value: unknown): string | null => {
+  const raw = normalizeDirectoryPeerText(value);
+  if (!raw) {
+    return null;
+  }
+  const digits = raw.replace(/[^\d]/g, "");
+  if (/^(\d+)(?::\d+)?@(s\.whatsapp\.net|hosted|lid)$/i.test(raw)) {
+    return digits.length >= 6 && digits.length <= 15 ? `+${digits}` : null;
+  }
+  if (/^\+?\d+$/.test(raw)) {
+    return digits.length >= 6 && digits.length <= 15 ? `+${digits}` : null;
+  }
+  return null;
 };
 
-const resolvePrimaryModelForTier = (modelTier: ModelTier | undefined) =>
-  MODEL_PRIMARY_BY_TIER[modelTier ?? "best"] ?? MODEL_PRIMARY_BY_TIER.best;
-
-const resolveModelFallbacksForTier = (modelTier: ModelTier | undefined) =>
-  [...(MODEL_FALLBACKS_BY_TIER[modelTier ?? "best"] ?? MODEL_FALLBACKS_BY_TIER.best)];
-
-const resolveContextTokensForTier = (modelTier: ModelTier | undefined) =>
-  MODEL_CONTEXT_TOKENS_BY_TIER[modelTier ?? "best"] ?? MODEL_CONTEXT_TOKENS_BY_TIER.best;
+const normalizeWhatsAppDirectoryPeers = (
+  peers: WhatsAppDirectoryPeer[] | unknown[],
+): NormalizedWhatsAppDirectoryPeer[] => {
+  const dedup = new Map<string, NormalizedWhatsAppDirectoryPeer>();
+  for (const peer of peers) {
+    const record = isRecord(peer) ? peer : null;
+    const id = normalizeWhatsAppDirectoryPeerId(record?.id);
+    if (!id) {
+      continue;
+    }
+    const name = normalizeDirectoryPeerText(record?.name) ?? undefined;
+    const handle = normalizeDirectoryPeerText(record?.handle) ?? undefined;
+    const accountId = normalizeDirectoryPeerText(record?.accountId) ?? undefined;
+    const existing = dedup.get(id);
+    if (!existing) {
+      dedup.set(id, { id, name, handle, accountId });
+      continue;
+    }
+    dedup.set(id, {
+      id,
+      name: existing.name ?? name,
+      handle: existing.handle ?? handle,
+      accountId: existing.accountId ?? accountId,
+    });
+  }
+  return Array.from(dedup.values()).sort((a, b) => a.id.localeCompare(b.id));
+};
 
 const buildHostOrigin = (hostHeader: string | null | undefined, protocol: "http" | "https") => {
   const trimmed = hostHeader?.trim();
@@ -308,93 +333,195 @@ const ensureGatewayControlUiConfig = async (
   }
 };
 
-const ensureGatewayAgentModelConfig = async (
+const sameStringArray = (left: string[], right: string[]) =>
+  left.length === right.length && left.every((value, index) => value === right[index]);
+
+const detectGatewayConfigDrift = async (
   authDirPath: string,
+  whatsappId: string,
   modelTier: ModelTier | undefined,
-): Promise<{ changed: boolean }> => {
+  directoryPeers: WhatsAppDirectoryPeer[] = [],
+): Promise<{ drifted: boolean; reasons: string[] }> => {
+  const reasons: string[] = [];
   try {
     const configPath = path.join(authDirPath, "openclaw.json");
     const raw = await fs.readFile(configPath, "utf-8");
     const parsedUnknown = JSON.parse(raw) as unknown;
     if (!isRecord(parsedUnknown)) {
-      return { changed: false };
+      return { drifted: true, reasons: ["config not an object"] };
     }
     const parsed = parsedUnknown;
     const targetPrimaryModel = resolvePrimaryModelForTier(modelTier);
     const targetFallbackModels = resolveModelFallbacksForTier(modelTier);
     const targetContextTokens = resolveContextTokensForTier(modelTier);
-
-    let changed = false;
-    let agents = isRecord(parsed.agents) ? parsed.agents : null;
-    if (!agents) {
-      agents = {};
-      parsed.agents = agents;
-      changed = true;
-    }
-    let defaults = isRecord(agents.defaults) ? agents.defaults : null;
-    if (!defaults) {
-      defaults = {};
-      agents.defaults = defaults;
-      changed = true;
+    const agents = isRecord(parsed.agents) ? parsed.agents : null;
+    const defaults = isRecord(agents?.defaults) ? agents?.defaults : null;
+    const currentWorkspace =
+      typeof defaults?.workspace === "string" && defaults.workspace.trim().length > 0
+        ? defaults.workspace.trim()
+        : null;
+    if (currentWorkspace !== DEFAULT_GATEWAY_ROOT_DIR) {
+      reasons.push(`agents.defaults.workspace mismatch: ${String(currentWorkspace)}`);
     }
     const currentContextTokens =
-      typeof defaults.contextTokens === "number" && Number.isFinite(defaults.contextTokens)
+      typeof defaults?.contextTokens === "number" && Number.isFinite(defaults.contextTokens)
         ? Math.floor(defaults.contextTokens)
         : null;
     if (currentContextTokens !== targetContextTokens) {
-      defaults.contextTokens = targetContextTokens;
-      changed = true;
+      reasons.push(`agents.defaults.contextTokens mismatch: ${String(currentContextTokens)}`);
     }
-    let model = isRecord(defaults.model) ? defaults.model : null;
-    if (!model) {
-      model = {};
-      defaults.model = model;
-      changed = true;
-    }
+    const model = isRecord(defaults?.model) ? defaults?.model : null;
     const currentPrimaryModel =
-      typeof model.primary === "string" && model.primary.trim().length > 0
+      typeof model?.primary === "string" && model.primary.trim().length > 0
         ? model.primary.trim()
         : null;
     if (currentPrimaryModel !== targetPrimaryModel) {
-      model.primary = targetPrimaryModel;
-      changed = true;
+      reasons.push(`agents.defaults.model.primary mismatch: ${String(currentPrimaryModel)}`);
     }
 
-    const currentFallbackModels = Array.isArray(model.fallbacks)
+    const currentFallbackModels = Array.isArray(model?.fallbacks)
       ? model.fallbacks
           .map((value) => (typeof value === "string" ? value.trim() : ""))
           .filter((value) => value.length > 0)
       : [];
-    const fallbackChanged =
-      currentFallbackModels.length !== targetFallbackModels.length ||
-      currentFallbackModels.some((value, index) => value !== targetFallbackModels[index]);
-    if (fallbackChanged) {
-      model.fallbacks = targetFallbackModels;
-      changed = true;
+    if (!sameStringArray(currentFallbackModels, targetFallbackModels)) {
+      reasons.push("agents.defaults.model.fallbacks mismatch");
     }
 
-    let tools = isRecord(parsed.tools) ? parsed.tools : null;
-    if (!tools) {
-      tools = {};
-      parsed.tools = tools;
-      changed = true;
-    }
+    const tools = isRecord(parsed.tools) ? parsed.tools : null;
     const currentToolsProfile =
-      typeof tools.profile === "string" && tools.profile.trim().length > 0
+      typeof tools?.profile === "string" && tools.profile.trim().length > 0
         ? tools.profile.trim()
         : null;
-    if (!currentToolsProfile) {
-      tools.profile = DEFAULT_TOOLS_PROFILE;
-      changed = true;
+    if (currentToolsProfile !== DEFAULT_TOOLS_PROFILE) {
+      reasons.push(`tools.profile mismatch: ${String(currentToolsProfile)}`);
+    }
+    const currentAlsoAllow = Array.isArray(tools?.alsoAllow)
+      ? tools.alsoAllow
+          .map((value) => (typeof value === "string" ? value.trim() : ""))
+          .filter((value) => value.length > 0)
+      : [];
+    for (const toolName of DEFAULT_TOOLS_ALSO_ALLOW) {
+      if (!currentAlsoAllow.includes(toolName)) {
+        reasons.push(`tools.alsoAllow missing: ${toolName}`);
+      }
     }
 
-    if (changed) {
-      await fs.writeFile(configPath, JSON.stringify(parsed, null, 2), "utf-8");
+    const browser = isRecord(parsed.browser) ? parsed.browser : null;
+    if (browser?.enabled !== DEFAULT_BROWSER_ENABLED) {
+      reasons.push(`browser.enabled mismatch: ${String(browser?.enabled)}`);
     }
-    return { changed };
+    const currentDefaultProfile =
+      typeof browser?.defaultProfile === "string" && browser.defaultProfile.trim().length > 0
+        ? browser.defaultProfile.trim()
+        : null;
+    if (currentDefaultProfile !== DEFAULT_BROWSER_DEFAULT_PROFILE) {
+      reasons.push(`browser.defaultProfile mismatch: ${String(currentDefaultProfile)}`);
+    }
+    if (browser?.headless !== DEFAULT_BROWSER_HEADLESS) {
+      reasons.push(`browser.headless mismatch: ${String(browser?.headless)}`);
+    }
+    if (browser?.noSandbox !== DEFAULT_BROWSER_NO_SANDBOX) {
+      reasons.push(`browser.noSandbox mismatch: ${String(browser?.noSandbox)}`);
+    }
+
+    const channels = isRecord(parsed.channels) ? parsed.channels : null;
+    const whatsapp = isRecord(channels?.whatsapp) ? channels?.whatsapp : null;
+    const currentDmPolicy =
+      typeof whatsapp?.dmPolicy === "string" && whatsapp.dmPolicy.trim().length > 0
+        ? whatsapp.dmPolicy.trim()
+        : null;
+    if (currentDmPolicy !== "allowlist") {
+      reasons.push(`channels.whatsapp.dmPolicy mismatch: ${String(currentDmPolicy)}`);
+    }
+    if (whatsapp?.selfChatMode !== true) {
+      reasons.push(`channels.whatsapp.selfChatMode mismatch: ${String(whatsapp?.selfChatMode)}`);
+    }
+    const currentAllowFrom = Array.isArray(whatsapp?.allowFrom)
+      ? whatsapp.allowFrom
+          .map((value) => (typeof value === "string" ? value.trim() : ""))
+          .filter((value) => value.length > 0)
+      : [];
+    if (!sameStringArray(currentAllowFrom, [whatsappId])) {
+      reasons.push(`channels.whatsapp.allowFrom mismatch: [${currentAllowFrom.join(", ")}]`);
+    }
+
+    const accounts = isRecord(whatsapp?.accounts) ? whatsapp?.accounts : null;
+    const defaultAccount = isRecord(accounts?.default) ? accounts?.default : null;
+    const currentAuthDir =
+      typeof defaultAccount?.authDir === "string" && defaultAccount.authDir.trim().length > 0
+        ? defaultAccount.authDir.trim()
+        : null;
+    if (currentAuthDir !== DEFAULT_GATEWAY_WHATSAPP_AUTH_DIR) {
+      reasons.push(`channels.whatsapp.accounts.default.authDir mismatch: ${String(currentAuthDir)}`);
+    }
+
+    const targetDirectoryPeers = normalizeWhatsAppDirectoryPeers(directoryPeers);
+    const currentDirectoryPeers = Array.isArray(whatsapp?.directoryPeers)
+      ? normalizeWhatsAppDirectoryPeers(whatsapp.directoryPeers)
+      : [];
+    const directoryPeersDiffer =
+      currentDirectoryPeers.length !== targetDirectoryPeers.length ||
+      currentDirectoryPeers.some((peer, index) => {
+        const target = targetDirectoryPeers[index];
+        return (
+          peer.id !== target?.id ||
+          (peer.name ?? null) !== (target?.name ?? null) ||
+          (peer.handle ?? null) !== (target?.handle ?? null) ||
+          (peer.accountId ?? null) !== (target?.accountId ?? null)
+        );
+      });
+    if (directoryPeersDiffer) {
+      reasons.push("channels.whatsapp.directoryPeers mismatch");
+    }
+
+    const plugins = isRecord(parsed.plugins) ? parsed.plugins : null;
+    const pluginLoad = isRecord(plugins?.load) ? plugins?.load : null;
+    const currentPluginPaths = Array.isArray(pluginLoad?.paths)
+      ? pluginLoad.paths
+          .map((value) => (typeof value === "string" ? value.trim() : ""))
+          .filter((value) => value.length > 0)
+      : [];
+    if (!currentPluginPaths.includes(DEFAULT_GATEWAY_ROOT_DIR)) {
+      reasons.push(`plugins.load.paths missing ${DEFAULT_GATEWAY_ROOT_DIR}`);
+    }
+    const pluginEntries = isRecord(plugins?.entries) ? plugins?.entries : null;
+    const whatsappEntry = isRecord(pluginEntries?.whatsapp) ? pluginEntries?.whatsapp : null;
+    const clawdlyProfileEntry =
+      isRecord(pluginEntries?.["clawdly-profile"]) ? pluginEntries?.["clawdly-profile"] : null;
+    if (whatsappEntry?.enabled !== true) {
+      reasons.push("plugins.entries.whatsapp.enabled must be true");
+    }
+    if (clawdlyProfileEntry?.enabled !== true) {
+      reasons.push("plugins.entries.clawdly-profile.enabled must be true");
+    }
+
+    return { drifted: reasons.length > 0, reasons };
   } catch {
-    return { changed: false };
+    return { drifted: true, reasons: ["config unreadable or invalid JSON"] };
   }
+};
+
+const detectGatewayRuntimeDrift = (
+  runtime: Awaited<ReturnType<Provisioner["getRuntimeFingerprint"]>>,
+  gateway: GatewayInstanceRecord,
+) => {
+  const reasons: string[] = [];
+  if (gateway.configVersion !== runtime.configVersion) {
+    reasons.push(`configVersion mismatch: ${gateway.configVersion} != ${runtime.configVersion}`);
+  }
+  if (gateway.pluginVersion !== runtime.pluginVersion) {
+    reasons.push(`pluginVersion mismatch: ${gateway.pluginVersion} != ${runtime.pluginVersion}`);
+  }
+  if (gateway.runtimePolicyVersion !== runtime.runtimePolicyVersion) {
+    reasons.push(
+      `runtimePolicyVersion mismatch: ${gateway.runtimePolicyVersion} != ${runtime.runtimePolicyVersion}`,
+    );
+  }
+  if (gateway.imageRef !== runtime.imageRef) {
+    reasons.push(`imageRef mismatch: ${gateway.imageRef} != ${runtime.imageRef}`);
+  }
+  return reasons;
 };
 
 const parseAdminProxyUrl = (rawUrl: string | undefined) => {
@@ -456,6 +583,89 @@ const start = async () => {
     }
   }
 
+  const ensureGatewayDesiredState = async (params: {
+    caller: string;
+    gateway: GatewayInstanceRecord;
+    whatsappId: string;
+    modelTier: ModelTier | undefined;
+    runtime?: Awaited<ReturnType<Provisioner["getRuntimeFingerprint"]>>;
+  }) => {
+    const runtime = params.runtime ?? await provisioner.getRuntimeFingerprint();
+    const directoryPeers = buildWhatsAppDirectoryPeers(
+      await store.getProfileData(params.gateway.userId),
+      { excludeIds: [params.whatsappId] },
+    );
+    const configDrift = await detectGatewayConfigDrift(
+      params.gateway.authDirPath,
+      params.whatsappId,
+      params.modelTier,
+      directoryPeers,
+    );
+    const runtimeDrift = detectGatewayRuntimeDrift(runtime, params.gateway);
+    const reasons = [...runtimeDrift, ...configDrift.reasons];
+    if (reasons.length === 0) {
+      return { reprovisioned: false, reasons };
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[gateway-rollout] reprovision caller=${params.caller} userId=${params.gateway.userId} reasons=${reasons.join(" | ")}`,
+    );
+    await provisioner.provision(
+      params.gateway.userId,
+      params.gateway.authDirPath,
+      params.whatsappId,
+      { modelTier: params.modelTier },
+    );
+    return { reprovisioned: true, reasons };
+  };
+
+  let gatewayRolloutRunning = false;
+  const runGatewayRolloutSweep = async (caller: string) => {
+    if (gatewayRolloutRunning) {
+      return;
+    }
+    gatewayRolloutRunning = true;
+    try {
+      const [runtime, gateways, users, agents] = await Promise.all([
+        provisioner.getRuntimeFingerprint(),
+        store.listGatewayInstances(),
+        store.listUsers(),
+        store.listAgents(),
+      ]);
+      const usersById = new Map(users.map((user) => [user.id, user]));
+      const agentsByUserId = new Map(agents.map((agent) => [agent.userId, agent]));
+      for (const gateway of gateways) {
+        const user = usersById.get(gateway.userId);
+        if (!user?.whatsappId) {
+          continue;
+        }
+        const agent = agentsByUserId.get(gateway.userId);
+        try {
+          await ensureGatewayDesiredState({
+            caller,
+            gateway,
+            whatsappId: user.whatsappId,
+            modelTier: agent?.modelTier,
+            runtime,
+          });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[gateway-rollout] failed caller=${caller} userId=${gateway.userId}:`, err);
+        }
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[gateway-rollout] sweep failed caller=${caller}:`, err);
+    } finally {
+      gatewayRolloutRunning = false;
+    }
+  };
+  void runGatewayRolloutSweep("startup");
+  const gatewayRolloutInterval = setInterval(
+    () => void runGatewayRolloutSweep("interval"),
+    deployConfig.gatewayReconcileIntervalMs,
+  );
+
   // Periodic cleanup: purge expired sessions + stale temp dirs
   const runReaper = async () => {
     try {
@@ -488,59 +698,84 @@ const start = async () => {
   const adminToken = deployConfig.adminToken.trim();
 
   // ---------------------------------------------------------------------------
-  // Profile enrichment debounce state
-  // Each running gateway POSTs message events here. We batch them and
-  // re-synthesize the user profile after PROFILE_BATCH_SIZE messages or
-  // PROFILE_DEBOUNCE_MS ms have elapsed, whichever comes first.
+  // Profile/memory projection state
+  //
+  // - Canonical data source: raw sync payloads + append-only message events.
+  // - Event path: debounce durable profile-note extraction.
+  // - Scheduled path: periodic conversation-summary sweep for updated peers.
   // ---------------------------------------------------------------------------
-  const PROFILE_BATCH_SIZE = 10;
-  const PROFILE_DEBOUNCE_MS = 30 * 60 * 1000; // 30 minutes
-  const profileEventCounters = new Map<string, number>();
-  const profileDebounceTimers = new Map<string, NodeJS.Timeout>();
+  const PROFILE_INCREMENTAL_DEBOUNCE_MS = 20 * 1000; // 20 seconds
+  const PROFILE_SWEEP_INTERVAL_MS = deployConfig.profileProjectionIntervalMs;
 
-  const triggerProfileSynthesis = (userId: string, authDirPath: string, modelTier: ModelTier | undefined, caller = "batch-debounce") => {
-    const existing = profileDebounceTimers.get(userId);
+  const profileIncrementalTimers = new Map<string, NodeJS.Timeout>();
+
+  const maybeProjectUserProfile = async (
+    userId: string,
+    whatsappId: string,
+    authDirPath: string,
+    caller: string,
+  ) => {
+    const profileData = await store.getProfileData(userId);
+    const hasProjectedProfile = Boolean(profileData?.profileMd && profileData.profileMd.trim().length > 0);
+    const rawUpdatedAt = profileData?.rawUpdatedAt?.getTime() ?? 0;
+    const profileUpdatedAt = profileData?.profileUpdatedAt?.getTime() ?? 0;
+    if (!hasProjectedProfile || rawUpdatedAt > profileUpdatedAt) {
+      await projectUserProfile(userId, whatsappId, authDirPath, store, caller);
+    }
+  };
+
+  const scheduleIncrementalProfileUpdate = (userId: string, authDirPath: string) => {
+    const existing = profileIncrementalTimers.get(userId);
     if (existing) {
       clearTimeout(existing);
     }
-    profileEventCounters.delete(userId);
     const timer = setTimeout(() => {
-      profileDebounceTimers.delete(userId);
+      profileIncrementalTimers.delete(userId);
       void (async () => {
         try {
-          const user = (await store.listUsers()).find((u) => u.id === userId);
-          if (!user) return;
-          await synthesizeUserProfile(userId, user.whatsappId, authDirPath, modelTier, store, caller);
+          await runIncrementalProfileUpdate({
+            userId,
+            authDir: authDirPath,
+            store,
+          });
         } catch (err) {
-          console.warn(`Profile re-synthesis failed for ${userId}:`, err);
+          console.warn(`Incremental profile update failed for ${userId}:`, err);
         }
       })();
-    }, 2_000); // short delay so agent_note and a burst of messages are coalesced
-    profileDebounceTimers.set(userId, timer);
+    }, PROFILE_INCREMENTAL_DEBOUNCE_MS);
+    profileIncrementalTimers.set(userId, timer);
   };
 
-  const recordProfileEvent = (userId: string, authDirPath: string, modelTier: ModelTier | undefined) => {
-    const count = (profileEventCounters.get(userId) ?? 0) + 1;
-    profileEventCounters.set(userId, count);
-    if (count >= PROFILE_BATCH_SIZE) {
-      triggerProfileSynthesis(userId, authDirPath, modelTier);
-    } else if (!profileDebounceTimers.has(userId)) {
-      // Start the 30-minute outer timer on first message
-      const timer = setTimeout(() => {
-        profileDebounceTimers.delete(userId);
-        profileEventCounters.delete(userId);
-        void (async () => {
-          try {
-            const user = (await store.listUsers()).find((u) => u.id === userId);
-            if (!user) return;
-            await synthesizeUserProfile(userId, user.whatsappId, authDirPath, modelTier, store, "30min-timer");
-          } catch (err) {
-            console.warn(`Profile re-synthesis failed for ${userId}:`, err);
-          }
-        })();
-      }, PROFILE_DEBOUNCE_MS);
-      profileDebounceTimers.set(userId, timer);
+  const runProfileProjectionSweep = async () => {
+    const users = await store.listUsers();
+    for (const user of users) {
+      const gateway = await store.getGatewayInstanceByUserId(user.id);
+      const authDirPath = gateway?.authDirPath ?? path.join(deployConfig.authRoot, user.id);
+      try {
+        await maybeProjectUserProfile(user.id, user.whatsappId, authDirPath, "periodic-sweep");
+      } catch (err) {
+        console.warn(`Profile projection sweep failed for ${user.id}:`, err);
+      }
+      try {
+        await runConversationSummarySweep({
+          userId: user.id,
+          authDir: authDirPath,
+          store,
+        });
+      } catch (err) {
+        console.warn(`Conversation summary sweep failed for ${user.id}:`, err);
+      }
     }
+  };
+
+  void runProfileProjectionSweep();
+  const profileSweepInterval = setInterval(
+    () => void runProfileProjectionSweep(),
+    PROFILE_SWEEP_INTERVAL_MS,
+  );
+
+  const recordProfileEvent = (userId: string, authDirPath: string) => {
+    scheduleIncrementalProfileUpdate(userId, authDirPath);
   };
 
   const requireAdmin: express.RequestHandler = (req, res, next) => {
@@ -594,16 +829,35 @@ const start = async () => {
           events,
           sessionTtlMs: deployConfig.sessionTtlMs,
           onProfileDataReady: (userId) => {
-            // Raw profile data was just saved. We'll synthesize after we know authDir (post-provision).
-            // Mark that this user has fresh data so startSessionFlow can trigger synthesis.
-            profileEventCounters.set(userId, 0);
+            void (async () => {
+              try {
+                const users = await store.listUsers();
+                const user = users.find((item) => item.id === userId);
+                if (!user) {
+                  return;
+                }
+                const projectedAuthDir = path.join(deployConfig.authRoot, userId);
+                await projectUserProfile(
+                  userId,
+                  user.whatsappId,
+                  projectedAuthDir,
+                  store,
+                  "login-worker-raw-ready",
+                );
+              } catch (err) {
+                console.warn(`Early profile projection failed for ${userId}:`, err);
+              }
+            })();
           },
         });
         const linked = await store.getLoginSession(sessionId);
         if (!linked || linked.state !== "linked" || !linked.userId || !linked.whatsappId) {
           return;
         }
-        sessionUsers.set(sessionId, linked.userId);
+        const linkedUserId = linked.userId;
+        const linkedWhatsappId = linked.whatsappId;
+
+        sessionUsers.set(sessionId, linkedUserId);
         await store.updateLoginSession(sessionId, { state: "deploying" });
         events.emit(sessionId, {
           type: "status",
@@ -611,12 +865,12 @@ const start = async () => {
           message: "Provisioning your gateway...",
         });
 
-        const existingAgent = await store.getAgentByUserId(linked.userId);
+        const existingAgent = await store.getAgentByUserId(linkedUserId);
         const agentSettings =
-          existingAgent ?? (await store.createAgentForUser(linked.userId, defaultAgentSettings()));
+          existingAgent ?? (await store.createAgentForUser(linkedUserId, defaultAgentSettings()));
 
         // Move WA session data to the user's permanent directory
-        const userAuthDir = path.join(deployConfig.authRoot, linked.userId);
+        const userAuthDir = path.join(deployConfig.authRoot, linkedUserId);
         const permanentWaDir = path.join(userAuthDir, "wa-session-data");
         await fs.mkdir(permanentWaDir, { recursive: true });
         // Copy session auth files from the temp session dir to the user's dir
@@ -632,29 +886,27 @@ const start = async () => {
           // temp dir might not have any files yet
         }
 
-        // Run synthesis and provisioning in parallel to cut login time by ~20s.
-        // The plugin handles a missing profile gracefully, so it's fine if
-        // synthesis finishes slightly after the gateway starts.
-        const synthesisPromise = synthesizeUserProfile(
-          linked.userId,
-          linked.whatsappId,
+        // Run profile projection and provisioning in parallel. Projection is
+        // deterministic and fast, but we still avoid blocking readiness on it.
+        const projectionPromise = projectUserProfile(
+          linkedUserId,
+          linkedWhatsappId,
           userAuthDir,
-          agentSettings.modelTier,
           store,
           "login-flow",
         ).catch((err) => {
-          console.warn(`Initial profile synthesis failed for ${linked.userId}:`, err);
+          console.warn(`Initial profile projection failed for ${linkedUserId}:`, err);
         });
 
         const result = await provisioner.provision(
-          linked.userId,
+          linkedUserId,
           userAuthDir,
-          linked.whatsappId,
+          linkedWhatsappId,
           { modelTier: agentSettings.modelTier },
         );
 
-        // Let synthesis finish in the background — don't block the "ready" event.
-        void synthesisPromise;
+        // Let projection finish in the background — don't block the "ready" event.
+        void projectionPromise;
 
         if (!result.healthy) {
           throw new Error("Gateway container failed to start.");
@@ -665,50 +917,50 @@ const start = async () => {
         // After a fresh QR registration, the phone uploads its chat history to WA
         // servers in the background (takes 1–5 min). Once uploaded, WA delivers
         // messaging-history.set to the running gateway. We schedule a deferred
-        // reprovision to capture that data and re-synthesize the profile.
-        const profileAtLogin = await store.getProfileData(linked.userId);
+        // reprovision to capture that data and re-project the profile.
+        const profileAtLogin = await store.getProfileData(linkedUserId);
         const contactsAtLogin = (() => {
           try { return JSON.parse(profileAtLogin?.contactsJson ?? "[]"); } catch { return []; }
         })();
         if (!Array.isArray(contactsAtLogin) || contactsAtLogin.length === 0) {
           const DEFERRED_MS = 3 * 60 * 1000;
           // eslint-disable-next-line no-console
-          console.log(`[login-flow] no WA contacts captured — scheduling deferred sync in ${DEFERRED_MS / 1000}s for userId=${linked.userId}`);
+          console.log(`[login-flow] no WA contacts captured — scheduling deferred sync in ${DEFERRED_MS / 1000}s for userId=${linkedUserId}`);
           setTimeout(() => {
             void (async () => {
               try {
-                const current = await store.getProfileData(linked.userId);
+                const current = await store.getProfileData(linkedUserId);
                 const currentContacts = (() => {
                   try { return JSON.parse(current?.contactsJson ?? "[]"); } catch { return []; }
                 })();
                 if (Array.isArray(currentContacts) && currentContacts.length > 0) {
                   // eslint-disable-next-line no-console
-                  console.log(`[login-flow] deferred sync skipped — contacts already present for userId=${linked.userId}`);
+                  console.log(`[login-flow] deferred sync skipped — contacts already present for userId=${linkedUserId}`);
                   return;
                 }
                 // eslint-disable-next-line no-console
-                console.log(`[login-flow] deferred sync starting for userId=${linked.userId}`);
-                await provisioner.deprovision(linked.userId);
+                console.log(`[login-flow] deferred sync starting for userId=${linkedUserId}`);
+                await provisioner.deprovision(linkedUserId);
                 const deferred = await collectWhatsAppSyncData(permanentWaDir, 60_000);
                 if (deferred.contacts.length > 0 || deferred.chats.length > 0) {
-                  await store.upsertRawProfileData(linked.userId, deferred);
-                  await synthesizeUserProfile(linked.userId, linked.whatsappId, userAuthDir, agentSettings.modelTier, store, "deferred-login-sync");
+                  await store.upsertRawProfileData(linkedUserId, deferred);
+                  await projectUserProfile(linkedUserId, linkedWhatsappId, userAuthDir, store, "deferred-login-sync");
                   // eslint-disable-next-line no-console
-                  console.log(`[login-flow] deferred sync complete — contacts=${deferred.contacts.length} chats=${deferred.chats.length} for userId=${linked.userId}`);
+                  console.log(`[login-flow] deferred sync complete — contacts=${deferred.contacts.length} chats=${deferred.chats.length} for userId=${linkedUserId}`);
                 } else {
                   // eslint-disable-next-line no-console
-                  console.warn(`[login-flow] deferred sync: still no WA data for userId=${linked.userId} — phone may not have finished uploading yet`);
+                  console.warn(`[login-flow] deferred sync: still no WA data for userId=${linkedUserId} — phone may not have finished uploading yet`);
                 }
               } catch (err) {
                 // eslint-disable-next-line no-console
-                console.warn(`[login-flow] deferred sync failed for userId=${linked.userId}:`, err);
+                console.warn(`[login-flow] deferred sync failed for userId=${linkedUserId}:`, err);
               } finally {
                 // Always restart the gateway whether sync succeeded or not
                 try {
-                  await provisioner.provision(linked.userId, userAuthDir, linked.whatsappId, { modelTier: agentSettings.modelTier });
+                  await provisioner.provision(linkedUserId, userAuthDir, linkedWhatsappId, { modelTier: agentSettings.modelTier });
                 } catch (err) {
                   // eslint-disable-next-line no-console
-                  console.warn(`[login-flow] deferred sync: failed to reprovision userId=${linked.userId}:`, err);
+                  console.warn(`[login-flow] deferred sync: failed to reprovision userId=${linkedUserId}:`, err);
                 }
               }
             })();
@@ -1071,8 +1323,7 @@ const start = async () => {
     }
   });
 
-  // Re-run profile synthesis using whatever WA data is already in the DB.
-  // Useful after a prompt update or when the initial synthesis was poor quality.
+  // Re-run deterministic profile projection from raw WhatsApp data already in DB.
   app.post("/v1/admin/users/:userId/resynthesize", requireAdmin, async (req, res) => {
     const userId = Array.isArray(req.params.userId) ? req.params.userId[0] : req.params.userId;
     if (!userId) {
@@ -1086,13 +1337,12 @@ const start = async () => {
         res.status(404).json({ error: "user_not_found" });
         return;
       }
-      const agent = await store.getAgentByUserId(userId);
       const authDir = path.join(deployConfig.authRoot, userId);
-      await synthesizeUserProfile(userId, user.whatsappId ?? "", authDir, agent?.modelTier, store, "admin-resynthesize");
+      await projectUserProfile(userId, user.whatsappId ?? "", authDir, store, "admin-reproject");
       res.json({ ok: true });
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error(`[resynthesize] failed for userId=${userId}:`, err);
+      console.error(`[reproject] failed for userId=${userId}:`, err);
       res.status(500).json({ error: "resynthesize_failed" });
     }
   });
@@ -1153,12 +1403,12 @@ const start = async () => {
         console.log(`[reprovision] no WA credentials found — skipping sync for userId=${userId} (reset pending)`);
       }
 
-      // Step 3: Synthesize profile from collected WhatsApp data.
+      // Step 3: Rebuild deterministic profile projection from collected data.
       try {
-        await synthesizeUserProfile(userId, user.whatsappId, authDir, agent?.modelTier, store, "reprovision");
+        await projectUserProfile(userId, user.whatsappId, authDir, store, "reprovision");
       } catch (err) {
         // eslint-disable-next-line no-console
-        console.warn(`[reprovision] profile synthesis failed for userId=${userId}:`, err);
+        console.warn(`[reprovision] profile projection failed for userId=${userId}:`, err);
       }
 
       // Step 4: Provision new gateway container.
@@ -1282,20 +1532,62 @@ const start = async () => {
     const body = req.body ?? {};
     const eventType = typeof body.type === "string" ? body.type : "message";
     const content = typeof body.content === "string" ? body.content : "";
-
+    const channel = typeof body.channel === "string" && body.channel.trim().length > 0
+      ? body.channel.trim().toLowerCase()
+      : "whatsapp";
+    const direction = body.direction === "outbound" ? "outbound" : "inbound";
+    const peerIdRaw = (() => {
+      if (typeof body.peerId === "string" && body.peerId.trim().length > 0) {
+        return body.peerId;
+      }
+      if (typeof body.from === "string" && body.from.trim().length > 0) {
+        return body.from;
+      }
+      if (typeof body.to === "string" && body.to.trim().length > 0) {
+        return body.to;
+      }
+      return "";
+    })();
+    const peerId = peerIdRaw.trim();
+    const occurredAt = (() => {
+      const value = body.timestamp;
+      if (typeof value === "number" && Number.isFinite(value)) {
+        const asMs = value > 10_000_000_000 ? value : value * 1000;
+        const parsed = new Date(asMs);
+        return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+      }
+      if (typeof value === "string" && value.trim().length > 0) {
+        const parsed = new Date(value.trim());
+        return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+      }
+      return new Date();
+    })();
     if (eventType === "agent_note" && content.trim()) {
-      // Immediately append the agent's note to the profile file, then queue synthesis
+      // Immediately append the agent note to projected profile memory.
       try {
         await appendAgentNoteToProfile(gateway.authDirPath, content);
       } catch (err) {
         console.warn(`Failed to append agent note for ${userId}:`, err);
       }
-      const agent = await store.getAgentByUserId(userId);
-      triggerProfileSynthesis(userId, gateway.authDirPath, agent?.modelTier, "agent-note");
     } else if (eventType === "message") {
-      // Accumulate messages and trigger batched re-synthesis
-      const agent = await store.getAgentByUserId(userId);
-      recordProfileEvent(userId, gateway.authDirPath, agent?.modelTier);
+      if (!peerId || !content.trim()) {
+        res.json({ ok: true, skipped: "missing_peer_or_content" });
+        return;
+      }
+      const appended = await store.appendProfileMessageEvent({
+        userId,
+        channel,
+        peerId,
+        direction,
+        content: content.slice(0, 4000),
+        occurredAt,
+      });
+      try {
+        await appendConversationLogEntry(gateway.authDirPath, appended);
+      } catch (err) {
+        console.warn(`Failed to append conversation log for ${userId} peer=${peerId}:`, err);
+      }
+      recordProfileEvent(userId, gateway.authDirPath);
     }
 
     res.json({ ok: true });
@@ -1424,12 +1716,18 @@ const start = async () => {
     // Live status from Docker (updates DB as side effect)
     const gatewayStatus = await provisioner.inspectStatus(userId);
 
-    // Ensure model config is up to date
+    // Ensure gateway runtime/config/plugin versions are current
     const gateway = await store.getGatewayInstanceByUserId(userId);
     if (gateway) {
-      const modelConfig = await ensureGatewayAgentModelConfig(gateway.authDirPath, agent.modelTier);
-      if (modelConfig.changed) {
-        await provisioner.restartContainer(userId);
+      const users = await store.listUsers();
+      const user = users.find((item) => item.id === userId);
+      if (user?.whatsappId) {
+        await ensureGatewayDesiredState({
+          caller: "v1-agent-get",
+          gateway,
+          whatsappId: user.whatsappId,
+          modelTier: agent.modelTier,
+        });
       }
     }
 
@@ -1471,9 +1769,15 @@ const start = async () => {
     }
     const gateway = await store.getGatewayInstanceByUserId(userId);
     if (gateway) {
-      const modelConfig = await ensureGatewayAgentModelConfig(gateway.authDirPath, next.modelTier);
-      if (modelConfig.changed) {
-        await provisioner.restartContainer(userId);
+      const users = await store.listUsers();
+      const user = users.find((item) => item.id === userId);
+      if (user?.whatsappId) {
+        await ensureGatewayDesiredState({
+          caller: "v1-agent-patch",
+          gateway,
+          whatsappId: user.whatsappId,
+          modelTier: next.modelTier,
+        });
       }
     }
     res.json({
@@ -1671,6 +1975,11 @@ const start = async () => {
 
   const shutdown = () => {
     clearInterval(reaperInterval);
+    clearInterval(gatewayRolloutInterval);
+    clearInterval(profileSweepInterval);
+    for (const timer of profileIncrementalTimers.values()) {
+      clearTimeout(timer);
+    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
